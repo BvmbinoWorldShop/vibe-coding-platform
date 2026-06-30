@@ -47,7 +47,7 @@ export default function PlayerDetailPage({ params }: { params: Promise<{ id: str
   ]
 
   return (
-    <div className="p-8 max-w-[1400px]">
+    <div className="p-4 md:p-8 max-w-[1400px]">
       {/* Breadcrumb */}
       <div className="flex items-center gap-2 text-sm text-muted-foreground mb-4">
         <Link href="/dashboard/players" className="hover:text-foreground">Players</Link>
@@ -57,12 +57,12 @@ export default function PlayerDetailPage({ params }: { params: Promise<{ id: str
 
       {/* Player Header */}
       <div className="bg-card border border-border rounded-xl p-6 mb-6">
-        <div className="flex items-start gap-6">
+        <div className="flex flex-wrap items-start gap-6">
           <div className="w-20 h-20 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white text-3xl font-bold shrink-0">
             {player.number}
           </div>
-          <div className="flex-1">
-            <div className="flex items-center gap-3">
+          <div className="flex-1 min-w-0">
+            <div className="flex flex-wrap items-center gap-3">
               <h1 className="text-2xl font-bold text-foreground">{player.firstName} {player.lastName}</h1>
               <span className={`text-xs px-2.5 py-1 rounded-full ${
                 player.status === 'active' ? 'bg-green-500/10 text-green-500' :
@@ -119,12 +119,12 @@ export default function PlayerDetailPage({ params }: { params: Promise<{ id: str
       )}
 
       {/* Tabs */}
-      <div className="flex gap-1 mb-6 bg-muted/30 p-1 rounded-lg w-fit">
+      <div className="flex gap-1 mb-6 bg-muted/30 p-1 rounded-lg w-fit max-w-full overflow-x-auto">
         {tabs.map((tab) => (
           <button
             key={tab.key}
             onClick={() => setActiveTab(tab.key)}
-            className={`px-4 py-2 text-sm font-medium rounded-md transition-colors ${
+            className={`shrink-0 px-4 py-2 text-sm font-medium rounded-md transition-colors ${
               activeTab === tab.key
                 ? 'bg-background text-foreground shadow-sm'
                 : 'text-muted-foreground hover:text-foreground'

@@ -7,7 +7,7 @@ export default function GamesPage() {
   const getPlayer = (id: string) => players.find((p) => p.id === id)
 
   return (
-    <div className="p-8 max-w-[1400px]">
+    <div className="p-4 md:p-8 max-w-[1400px]">
       <div className="mb-8">
         <h1 className="text-2xl font-bold text-foreground">Games</h1>
         <p className="text-sm text-muted-foreground mt-1">Game history with full statistical breakdowns</p>

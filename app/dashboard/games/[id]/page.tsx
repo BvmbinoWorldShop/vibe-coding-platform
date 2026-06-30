@@ -35,7 +35,7 @@ export default function GameDetailPage({ params }: { params: Promise<{ id: strin
   ]
 
   return (
-    <div className="p-8 max-w-[1400px]">
+    <div className="p-4 md:p-8 max-w-[1400px]">
       {/* Header */}
       <div className="flex items-center gap-2 text-sm text-muted-foreground mb-4">
         <Link href="/dashboard/games" className="hover:text-foreground">Games</Link>
@@ -43,7 +43,7 @@ export default function GameDetailPage({ params }: { params: Promise<{ id: strin
         <span className="text-foreground">vs {game.opponent}</span>
       </div>
 
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-6">
         <div>
           <h1 className="text-2xl font-bold text-foreground">
             vs {game.opponent}
@@ -59,7 +59,7 @@ export default function GameDetailPage({ params }: { params: Promise<{ id: strin
       </div>
 
       {/* Team Totals */}
-      <div className="grid grid-cols-3 md:grid-cols-6 gap-3 mb-6">
+      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3 mb-6">
         <StatCard label="FG%" value={`${((teamFGM / Math.max(teamFGA, 1)) * 100).toFixed(1)}%`} subValue={`${teamFGM}/${teamFGA}`} size="sm" />
         <StatCard label="3PT%" value={`${((team3PM / Math.max(team3PA, 1)) * 100).toFixed(1)}%`} subValue={`${team3PM}/${team3PA}`} size="sm" />
         <StatCard label="Rebounds" value={teamReb} size="sm" />
@@ -71,7 +71,7 @@ export default function GameDetailPage({ params }: { params: Promise<{ id: strin
       {/* Quarter Breakdown */}
       <div className="bg-card border border-border rounded-xl p-6 mb-6">
         <h2 className="text-sm font-semibold text-foreground mb-4">Quarter Breakdown</h2>
-        <div className="grid grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           {game.quarterScores.map((q) => (
             <div key={q.quarter} className="bg-muted/30 rounded-lg p-4">
               <p className="text-xs font-medium text-muted-foreground mb-2">Quarter {q.quarter}</p>
@@ -96,12 +96,12 @@ export default function GameDetailPage({ params }: { params: Promise<{ id: strin
       </div>
 
       {/* Tabs */}
-      <div className="flex gap-1 mb-6 bg-muted/30 p-1 rounded-lg w-fit">
+      <div className="flex gap-1 mb-6 bg-muted/30 p-1 rounded-lg w-fit max-w-full overflow-x-auto">
         {tabs.map((tab) => (
           <button
             key={tab.key}
             onClick={() => setActiveTab(tab.key)}
-            className={`px-4 py-2 text-sm font-medium rounded-md transition-colors ${
+            className={`shrink-0 px-4 py-2 text-sm font-medium rounded-md transition-colors ${
               activeTab === tab.key
                 ? 'bg-background text-foreground shadow-sm'
                 : 'text-muted-foreground hover:text-foreground'

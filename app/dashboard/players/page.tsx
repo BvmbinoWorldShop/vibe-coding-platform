@@ -30,13 +30,13 @@ export default function PlayersPage() {
   }
 
   return (
-    <div className="p-8 max-w-[1400px]">
-      <div className="flex items-center justify-between mb-8">
+    <div className="p-4 md:p-8 max-w-[1400px]">
+      <div className="flex flex-wrap items-center justify-between gap-y-3 mb-8">
         <div>
           <h1 className="text-2xl font-bold text-foreground">Players & CRM</h1>
           <p className="text-sm text-muted-foreground mt-1">Player profiles, workouts, nutrition, and recovery tracking</p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <span className="text-xs px-2.5 py-1 rounded-full bg-green-500/10 text-green-500">
             {players.filter((p) => p.status === 'active').length} Active
           </span>

@@ -2,6 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
+import { useEffect, useState } from 'react'
 import { cn } from '@/lib/utils'
 
 const navItems = [
@@ -18,63 +19,126 @@ const iconPaths: Record<string, string> = {
   radio: 'M12 12m-2 0a2 2 0 1 0 4 0a2 2 0 1 0-4 0M4.93 19.07A10 10 0 0 1 2 12C2 6.48 6.48 2 12 2s10 4.48 10 10a10 10 0 0 1-2.93 7.07M7.76 16.24A6 6 0 0 1 6 12a6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-1.76 4.24',
 }
 
+function NavIcon({ icon, className }: { icon: string; className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d={iconPaths[icon]} />
+    </svg>
+  )
+}
+
+function BrandMark() {
+  return (
+    <div className="flex items-center gap-3">
+      <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-orange-500 to-red-600 flex items-center justify-center shrink-0">
+        <svg viewBox="0 0 24 24" className="w-6 h-6 text-white" fill="none" stroke="currentColor" strokeWidth="2">
+          <circle cx="12" cy="12" r="10" />
+          <path d="M4.93 4.93c4.08 4.08 10.06 4.08 14.14 0" />
+          <path d="M4.93 19.07c4.08-4.08 10.06-4.08 14.14 0" />
+          <line x1="12" y1="2" x2="12" y2="22" />
+        </svg>
+      </div>
+      <div>
+        <h1 className="text-sm font-bold text-foreground leading-tight">CourtIQ</h1>
+        <p className="text-xs text-muted-foreground">Basketball Analytics</p>
+      </div>
+    </div>
+  )
+}
+
+function useIsActive(href: string) {
+  const pathname = usePathname()
+  return href === '/dashboard' ? pathname === '/dashboard' : pathname.startsWith(href)
+}
+
 export function DashboardSidebar() {
+  const [mobileOpen, setMobileOpen] = useState(false)
   const pathname = usePathname()
 
+  useEffect(() => {
+    setMobileOpen(false)
+  }, [pathname])
+
   return (
-    <aside className="w-64 border-r border-border bg-sidebar flex flex-col h-screen sticky top-0">
-      <div className="p-6 border-b border-border">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-orange-500 to-red-600 flex items-center justify-center">
-            <svg viewBox="0 0 24 24" className="w-6 h-6 text-white" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="12" cy="12" r="10" />
-              <path d="M4.93 4.93c4.08 4.08 10.06 4.08 14.14 0" />
-              <path d="M4.93 19.07c4.08-4.08 10.06-4.08 14.14 0" />
-              <line x1="12" y1="2" x2="12" y2="22" />
-            </svg>
-          </div>
-          <div>
-            <h1 className="text-sm font-bold text-foreground leading-tight">CourtIQ</h1>
-            <p className="text-xs text-muted-foreground">Basketball Analytics</p>
+    <>
+      {/* Mobile top bar */}
+      <header className="md:hidden sticky top-0 z-30 flex items-center justify-between gap-3 px-4 py-3 border-b border-border bg-sidebar">
+        <BrandMark />
+        <button
+          type="button"
+          aria-label="Toggle navigation menu"
+          onClick={() => setMobileOpen((open) => !open)}
+          className="shrink-0 w-10 h-10 flex items-center justify-center rounded-lg border border-border text-foreground"
+        >
+          <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            {mobileOpen ? <path d="M18 6 6 18M6 6l12 12" /> : <path d="M3 6h18M3 12h18M3 18h18" />}
+          </svg>
+        </button>
+      </header>
+
+      {/* Mobile dropdown nav */}
+      {mobileOpen && (
+        <nav className="md:hidden sticky top-[60px] z-20 bg-sidebar border-b border-border p-3 space-y-1">
+          {navItems.map((item) => (
+            <MobileNavLink key={item.href} href={item.href} label={item.label} icon={item.icon} />
+          ))}
+        </nav>
+      )}
+
+      {/* Desktop sidebar */}
+      <aside className="hidden md:flex w-64 border-r border-border bg-sidebar flex-col h-screen sticky top-0 shrink-0">
+        <div className="p-6 border-b border-border">
+          <BrandMark />
+        </div>
+
+        <nav className="flex-1 p-4 space-y-1">
+          {navItems.map((item) => (
+            <DesktopNavLink key={item.href} href={item.href} label={item.label} icon={item.icon} />
+          ))}
+        </nav>
+
+        <div className="p-4 border-t border-border">
+          <div className="bg-accent/50 rounded-lg p-3">
+            <p className="text-xs font-medium text-foreground">Season 2025-26</p>
+            <p className="text-xs text-muted-foreground mt-0.5">38-16 (.704)</p>
+            <div className="mt-2 h-1.5 bg-muted rounded-full overflow-hidden">
+              <div className="h-full bg-green-500 rounded-full" style={{ width: '70.4%' }} />
+            </div>
           </div>
         </div>
-      </div>
+      </aside>
+    </>
+  )
+}
 
-      <nav className="flex-1 p-4 space-y-1">
-        {navItems.map((item) => {
-          const isActive = item.href === '/dashboard'
-            ? pathname === '/dashboard'
-            : pathname.startsWith(item.href)
+function DesktopNavLink({ href, label, icon }: { href: string; label: string; icon: string }) {
+  const isActive = useIsActive(href)
+  return (
+    <Link
+      href={href}
+      className={cn(
+        'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors',
+        isActive ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-accent/50'
+      )}
+    >
+      <NavIcon icon={icon} className="w-5 h-5" />
+      {label}
+    </Link>
+  )
+}
 
-          return (
-            <Link
-              key={item.href}
-              href={item.href}
-              className={cn(
-                'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors',
-                isActive
-                  ? 'bg-accent text-foreground'
-                  : 'text-muted-foreground hover:text-foreground hover:bg-accent/50'
-              )}
-            >
-              <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d={iconPaths[item.icon]} />
-              </svg>
-              {item.label}
-            </Link>
-          )
-        })}
-      </nav>
-
-      <div className="p-4 border-t border-border">
-        <div className="bg-accent/50 rounded-lg p-3">
-          <p className="text-xs font-medium text-foreground">Season 2025-26</p>
-          <p className="text-xs text-muted-foreground mt-0.5">38-16 (.704)</p>
-          <div className="mt-2 h-1.5 bg-muted rounded-full overflow-hidden">
-            <div className="h-full bg-green-500 rounded-full" style={{ width: '70.4%' }} />
-          </div>
-        </div>
-      </div>
-    </aside>
+function MobileNavLink({ href, label, icon }: { href: string; label: string; icon: string }) {
+  const isActive = useIsActive(href)
+  return (
+    <Link
+      href={href}
+      className={cn(
+        'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors',
+        isActive ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-accent/50'
+      )}
+    >
+      <NavIcon icon={icon} className="w-5 h-5" />
+      {label}
+    </Link>
   )
 }

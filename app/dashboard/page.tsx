@@ -19,7 +19,7 @@ export default function DashboardOverview() {
   const getPlayer = (id: string) => players.find((p) => p.id === id)
 
   return (
-    <div className="p-8 max-w-[1400px]">
+    <div className="p-4 md:p-8 max-w-[1400px]">
       <div className="flex items-center justify-between mb-8">
         <div>
           <h1 className="text-2xl font-bold text-foreground">Dashboard</h1>

@@ -40,7 +40,7 @@ export function BasketballCourt({ width = 500, height = 470, variant = 'half', c
   }
 
   return (
-    <svg viewBox="0 0 500 470" className={className} style={{ width: width, height: height }}>
+    <svg viewBox="0 0 500 470" className={className} style={{ width: '100%', height: 'auto', maxWidth: width, aspectRatio: `${width} / ${height}` }}>
       <rect x="0" y="0" width="500" height="470" fill="#1a2332" rx="4" />
       <rect x="10" y="10" width="480" height="450" fill="none" stroke="#2d4a6f" strokeWidth="2" />
 
@@ -84,12 +84,12 @@ export function ShotChart({ shots, width = 500, height = 470, selectedPlayer, cl
   const filteredShots = selectedPlayer ? shots.filter((s) => s.playerId === selectedPlayer) : shots
 
   return (
-    <div className={`relative ${className || ''}`}>
+    <div className={`relative ${className || ''}`} style={{ maxWidth: width }}>
       <BasketballCourt width={width} height={height} />
       <svg
         viewBox="0 0 500 470"
         className="absolute inset-0"
-        style={{ width: width, height: height }}
+        style={{ width: '100%', height: 'auto' }}
       >
         {filteredShots.map((shot, i) => (
           <circle
