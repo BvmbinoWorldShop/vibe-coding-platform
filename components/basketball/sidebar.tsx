@@ -10,6 +10,8 @@ const navItems = [
   { href: '/dashboard/games', label: 'Games', icon: 'calendar' },
   { href: '/dashboard/players', label: 'Players & CRM', icon: 'users' },
   { href: '/dashboard/live', label: 'Live Tracking', icon: 'radio' },
+  { href: '/dashboard/video', label: 'Video Analysis', icon: 'video' },
+  { href: '/dashboard/pro', label: 'Pro Leagues', icon: 'globe' },
 ]
 
 const iconPaths: Record<string, string> = {
@@ -17,6 +19,8 @@ const iconPaths: Record<string, string> = {
   calendar: 'M8 2v2M16 2v2M3 6h18M5 4h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z',
   users: 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75',
   radio: 'M12 12m-2 0a2 2 0 1 0 4 0a2 2 0 1 0-4 0M4.93 19.07A10 10 0 0 1 2 12C2 6.48 6.48 2 12 2s10 4.48 10 10a10 10 0 0 1-2.93 7.07M7.76 16.24A6 6 0 0 1 6 12a6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-1.76 4.24',
+  video: 'M23 7l-7 5 7 5V7zM14 5H3a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2z',
+  globe: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z',
 }
 
 function NavIcon({ icon, className }: { icon: string; className?: string }) {
@@ -39,7 +43,7 @@ function BrandMark() {
         </svg>
       </div>
       <div>
-        <h1 className="text-sm font-bold text-foreground leading-tight">CourtIQ</h1>
+        <h1 className="text-sm font-bold text-foreground leading-tight">Ball Analysis</h1>
         <p className="text-xs text-muted-foreground">Basketball Analytics</p>
       </div>
     </div>
