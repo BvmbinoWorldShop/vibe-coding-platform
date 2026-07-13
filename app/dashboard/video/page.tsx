@@ -15,10 +15,12 @@ import {
   type SessionEvent,
   type PlayerMovement,
 } from '@/lib/basketball/store'
-import { extractFrames, analyzeFrames, type AiEvent } from '@/lib/basketball/ai'
+import { extractFrames, extractFramesAt, analyzeFrames, confirmShotOutcome, type AiEvent, type ShotOutcome } from '@/lib/basketball/ai'
+import { loadDetector, detectFrame } from '@/lib/basketball/detector'
 
 type TrackPoint = { t: number; x: number; y: number }
-type Mode = 'tag' | 'track' | 'calibrate'
+type Mode = 'tag' | 'track' | 'calibrate' | 'hoop'
+interface ScanProposal { id: string; t: number; outcome: ShotOutcome }
 
 const fmtClock = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
 
@@ -50,6 +52,13 @@ export default function VideoAnalysisPage() {
   const [aiBusy, setAiBusy] = useState(false)
   const [aiError, setAiError] = useState<string | null>(null)
   const [proposals, setProposals] = useState<AiEvent[]>([])
+
+  // Scoring-play scan (hoop heuristic + AI confirmation)
+  const [hoopPoint, setHoopPoint] = useState<{ x: number; y: number } | null>(null)
+  const [scanBusy, setScanBusy] = useState(false)
+  const [scanStatus, setScanStatus] = useState<string | null>(null)
+  const [scanError, setScanError] = useState<string | null>(null)
+  const [scanProposals, setScanProposals] = useState<ScanProposal[]>([])
 
   // Save form
   const [opponent, setOpponent] = useState('')
@@ -176,6 +185,8 @@ export default function VideoAnalysisPage() {
         ...prev,
         [activePlayer]: [...(prev[activePlayer] ?? []), { t: now(), x, y }],
       }))
+    } else if (mode === 'hoop') {
+      setHoopPoint({ x, y })
     }
   }
 
@@ -237,6 +248,97 @@ export default function VideoAnalysisPage() {
     const byJersey = p.jersey != null ? db.roster.find((r) => r.number === p.jersey) : undefined
     addTag(p.type, p.t, byJersey?.id ?? activePlayer)
     setProposals((prev) => prev.filter((x) => x !== p))
+  }
+
+  // Scans the clip for ball-near-hoop moments (on-device, timecode-seeked —
+  // works the same whether the footage plays back slow or fast, since it
+  // steps through exact timestamps rather than watching in real time), then
+  // confirms each candidate's outcome with AI vision.
+  async function scanForScoringPlays() {
+    const video = videoRef.current
+    if (!video || source !== 'file' || !hoopPoint || !db.settings.mistralKey) return
+    setScanBusy(true)
+    setScanError(null)
+    setScanProposals([])
+    const wasPaused = video.paused
+    video.pause()
+    try {
+      setScanStatus('Loading on-device detector…')
+      const model = await loadDetector()
+      const duration = isFinite(video.duration) ? video.duration : aiEnd
+      const scanEndT = Math.min(duration, aiEnd || duration)
+      const scanStartT = Math.max(0, aiStart || 0)
+      const step = 0.4
+      const candidates: number[] = []
+      let lastCandidate = -Infinity
+      for (let t = scanStartT; t <= scanEndT && candidates.length < 10; t += step) {
+        setScanStatus(`Scanning ${fmtClock(t)} / ${fmtClock(scanEndT)}…`)
+        await new Promise<void>((resolve, reject) => {
+          const onSeek = () => {
+            video.removeEventListener('seeked', onSeek)
+            resolve()
+          }
+          video.addEventListener('seeked', onSeek)
+          video.currentTime = t
+          setTimeout(() => reject(new Error('seek timeout')), 4000)
+        }).catch(() => {})
+        const dets = await detectFrame(model, video, 0.4)
+        const ball = dets.find((d) => d.cls === 'sports ball')
+        if (ball) {
+          const cx = ball.x + ball.w / 2
+          const cy = ball.y + ball.h / 2
+          const dist = Math.hypot(cx - hoopPoint.x, cy - hoopPoint.y)
+          if (dist < 0.09 && t - lastCandidate > 3) {
+            candidates.push(t)
+            lastCandidate = t
+          }
+        }
+      }
+      if (candidates.length === 0) {
+        setScanError('No ball-near-hoop moments found in this range. Try re-marking the hoop or widening the clip range.')
+        return
+      }
+      setScanStatus(`Found ${candidates.length} candidate moment(s) — confirming with AI…`)
+      const rosterHint = db.roster.map((p) => `#${p.number} ${p.name}`).join(', ')
+      const results: ScanProposal[] = []
+      for (const t of candidates) {
+        try {
+          const frames = await extractFramesAt(video, [Math.max(0, t - 0.6), Math.max(0, t - 0.3), t, t + 0.3])
+          const outcome = await confirmShotOutcome(db.settings.mistralKey, frames, rosterHint)
+          if (outcome.attempted) results.push({ id: uid(), t, outcome })
+        } catch {
+          // skip this candidate, keep scanning the rest
+        }
+      }
+      setScanProposals(results)
+      if (results.length === 0) setScanError('AI did not confirm a shot attempt among the candidates found.')
+    } catch (err) {
+      setScanError(err instanceof Error ? err.message : 'Scan failed')
+    } finally {
+      setScanStatus(null)
+      setScanBusy(false)
+      if (!wasPaused) video.play().catch(() => {})
+    }
+  }
+
+  function acceptScanProposal(sp: ScanProposal) {
+    const o = sp.outcome
+    const shotCode = o.shotType === '3PT' ? (o.made ? 'fg3m' : 'fg3x') : o.shotType === 'FT' ? (o.made ? 'ftm' : 'ftx') : o.made ? 'fg2m' : 'fg2x'
+    const shooter = o.shooterJersey != null ? db.roster.find((p) => p.number === o.shooterJersey) : undefined
+    if (shooter) addTag(shotCode, sp.t, shooter.id)
+    if (o.made) {
+      const assister = o.assistJersey != null ? db.roster.find((p) => p.number === o.assistJersey) : undefined
+      if (assister) addTag('ast', sp.t - 0.1, assister.id)
+      const hockey = o.hockeyAssistJersey != null ? db.roster.find((p) => p.number === o.hockeyAssistJersey) : undefined
+      if (hockey) addTag('hast', sp.t - 0.2, hockey.id)
+    } else {
+      const blocker = o.blockedByJersey != null ? db.roster.find((p) => p.number === o.blockedByJersey) : undefined
+      if (blocker) addTag('blk', sp.t, blocker.id)
+    }
+    setScanProposals((prev) => prev.filter((x) => x.id !== sp.id))
+  }
+  function dismissScanProposal(id: string) {
+    setScanProposals((prev) => prev.filter((x) => x.id !== id))
   }
 
   function saveSession() {
@@ -325,6 +427,12 @@ export default function VideoAnalysisPage() {
               {calPoints.map((p, i) => (
                 <circle key={i} cx={p.x * 100} cy={p.y * 100} r="0.9" fill="#facc15" />
               ))}
+              {hoopPoint && (
+                <g>
+                  <circle cx={hoopPoint.x * 100} cy={hoopPoint.y * 100} r="9" fill="none" stroke="#f97316" strokeWidth="0.3" strokeDasharray="1 1" />
+                  <circle cx={hoopPoint.x * 100} cy={hoopPoint.y * 100} r="0.8" fill="#f97316" />
+                </g>
+              )}
               {lastTrail.length > 1 && (
                 <polyline points={lastTrail.map((p) => `${p.x * 100},${p.y * 100}`).join(' ')}
                   fill="none" stroke="#f97316" strokeWidth="0.4" strokeOpacity="0.9" />
@@ -342,7 +450,7 @@ export default function VideoAnalysisPage() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2 mt-3">
-            {([['tag', 'Tag mode'], ['track', 'Track movement'], ['calibrate', 'Calibrate court']] as [Mode, string][]).map(([m, label]) => (
+            {([['tag', 'Tag mode'], ['track', 'Track movement'], ['calibrate', 'Calibrate court'], ['hoop', 'Mark hoop']] as [Mode, string][]).map(([m, label]) => (
               <button key={m} type="button" onClick={() => setMode(m)}
                 className={`px-3.5 py-2 text-sm font-medium rounded-lg border ${
                   mode === m ? 'border-orange-500 bg-orange-500/10 text-orange-500' : 'border-border text-muted-foreground hover:text-foreground'
@@ -364,10 +472,14 @@ export default function VideoAnalysisPage() {
                 Click the active player&apos;s position as they move.
               </span>
             )}
-            <span className={`ml-auto text-xs px-2.5 py-1 rounded-full ${
+            {mode === 'hoop' && <span className="text-xs text-muted-foreground">Click the rim once to enable scoring-play scanning.</span>}
+            <span className={`text-xs px-2.5 py-1 rounded-full ${
               metersPerUnit ? 'bg-green-500/10 text-green-500' : 'bg-yellow-500/10 text-yellow-500'
             }`}>
               {metersPerUnit ? 'Court calibrated' : 'Not calibrated'}
+            </span>
+            <span className={`ml-auto text-xs px-2.5 py-1 rounded-full ${hoopPoint ? 'bg-green-500/10 text-green-500' : 'bg-yellow-500/10 text-yellow-500'}`}>
+              {hoopPoint ? 'Hoop marked' : 'Hoop not marked'}
             </span>
           </div>
 
@@ -449,6 +561,74 @@ export default function VideoAnalysisPage() {
               </>
             )}
           </div>
+
+          {/* Scoring-play scan */}
+          {source === 'file' && (
+            <div className="mt-4 bg-card border border-border rounded-xl p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                <h2 className="text-sm font-semibold text-foreground">
+                  🏀 Scan for Scoring Plays <span className="text-xs font-normal text-muted-foreground">(on-device detector + AI confirmation)</span>
+                </h2>
+              </div>
+              <p className="text-xs text-muted-foreground mb-3">
+                Mark the hoop above, then scan the clip range (from the AI panel&apos;s start/end above).
+                This steps through exact timestamps rather than watching in real time, so it works the
+                same whether the footage is normal speed or sped up. Each candidate near the hoop gets
+                a quick AI vision check for made/missed, assist and block — you approve every one.
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={scanForScoringPlays}
+                  disabled={scanBusy || !hoopPoint || !db.settings.mistralKey}
+                  className="px-4 py-2 text-sm font-semibold rounded-lg bg-orange-600 text-white hover:bg-orange-500 disabled:opacity-40"
+                >
+                  {scanBusy ? 'Scanning…' : 'Scan clip for scoring plays'}
+                </button>
+                {!hoopPoint && <span className="text-xs text-muted-foreground">Mark the hoop first.</span>}
+                {!db.settings.mistralKey && (
+                  <Link href="/dashboard/settings" className="text-xs text-orange-500 hover:underline">Add free Mistral key →</Link>
+                )}
+              </div>
+              {scanStatus && <p className="text-xs text-orange-500 mt-2">{scanStatus}</p>}
+              {scanError && <p className="text-xs text-red-500 mt-2">{scanError}</p>}
+              {scanProposals.length > 0 && (
+                <div className="mt-3 border border-orange-500 rounded-lg overflow-hidden">
+                  <div className="flex items-center justify-between px-3 py-2 bg-orange-500/10 border-b border-orange-500">
+                    <p className="text-xs font-semibold text-orange-600 dark:text-orange-400">{scanProposals.length} detected play(s) — review and accept</p>
+                    <div className="flex gap-2">
+                      <button type="button" onClick={() => [...scanProposals].forEach(acceptScanProposal)} className="text-xs text-green-500 hover:underline">Accept all</button>
+                      <button type="button" onClick={() => setScanProposals([])} className="text-xs text-red-500 hover:underline">Dismiss all</button>
+                    </div>
+                  </div>
+                  <div className="max-h-56 overflow-y-auto">
+                    {scanProposals.map((sp) => {
+                      const o = sp.outcome
+                      const shooter = o.shooterJersey != null ? db.roster.find((p) => p.number === o.shooterJersey) : undefined
+                      const assister = o.assistJersey != null ? db.roster.find((p) => p.number === o.assistJersey) : undefined
+                      const blocker = o.blockedByJersey != null ? db.roster.find((p) => p.number === o.blockedByJersey) : undefined
+                      return (
+                        <div key={sp.id} className="flex items-center gap-2 px-3 py-2 text-xs border-b border-border last:border-0">
+                          <span className="tabular-nums text-muted-foreground w-12 shrink-0">{fmtClock(sp.t)}</span>
+                          <span className={`px-1.5 py-0.5 rounded font-semibold shrink-0 ${o.made ? 'bg-green-500/10 text-green-500' : 'bg-red-500/10 text-red-500'}`}>
+                            {o.shotType ?? '2PT'} {o.made ? 'MADE' : 'MISS'}
+                          </span>
+                          <span className="text-foreground truncate flex-1">
+                            {shooter ? `#${shooter.number} ${shooter.name}` : o.shooterJersey ? `#${o.shooterJersey} (not on roster)` : 'shooter unknown'}
+                            {assister && ` · assist #${assister.number} ${assister.name}`}
+                            {blocker && ` · blocked by #${blocker.number} ${blocker.name}`}
+                          </span>
+                          <span className={`shrink-0 ${o.confidence === 'high' ? 'text-green-500' : o.confidence === 'low' ? 'text-red-400' : 'text-yellow-500'}`}>{o.confidence}</span>
+                          <button type="button" onClick={() => acceptScanProposal(sp)} className="shrink-0 px-2 py-1 rounded bg-green-600 text-white font-semibold hover:bg-green-500">Accept</button>
+                          <button type="button" onClick={() => dismissScanProposal(sp.id)} className="shrink-0 text-red-500 hover:underline">✕</button>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Right column */}

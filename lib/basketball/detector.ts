@@ -136,3 +136,89 @@ export async function detectFrame(
       score: p.score,
     }))
 }
+
+// ---------- jersey-color team separation ----------
+// Genuinely on-device, no API calls: sample the average jersey color from
+// the torso region of each person box, then run 2-means clustering across
+// all currently visible boxes so the two teams separate by their real
+// jersey colors — not a guess, an actual pixel average.
+
+export interface RGB { r: number; g: number; b: number }
+
+let sampleCanvas: HTMLCanvasElement | null = null
+
+export function sampleTorsoColor(
+  source: HTMLVideoElement,
+  box: { x: number; y: number; w: number; h: number }
+): RGB | null {
+  if (!sampleCanvas) sampleCanvas = document.createElement('canvas')
+  const vw = source.videoWidth
+  const vh = source.videoHeight
+  if (!vw || !vh) return null
+  // Torso region: horizontally centered, upper-middle of the box (avoids
+  // the head and legs, where background/skin would skew the average).
+  const tx = box.x + box.w * 0.25
+  const ty = box.y + box.h * 0.2
+  const tw = box.w * 0.5
+  const th = box.h * 0.32
+  const sx = Math.max(0, Math.round(tx * vw))
+  const sy = Math.max(0, Math.round(ty * vh))
+  const sw = Math.max(1, Math.round(tw * vw))
+  const sh = Math.max(1, Math.round(th * vh))
+  sampleCanvas.width = sw
+  sampleCanvas.height = sh
+  const ctx = sampleCanvas.getContext('2d', { willReadFrequently: true })
+  if (!ctx) return null
+  try {
+    ctx.drawImage(source, sx, sy, sw, sh, 0, 0, sw, sh)
+    const { data } = ctx.getImageData(0, 0, sw, sh)
+    let r = 0, g = 0, b = 0, n = 0
+    for (let i = 0; i < data.length; i += 4) {
+      r += data[i]; g += data[i + 1]; b += data[i + 2]; n++
+    }
+    if (n === 0) return null
+    return { r: r / n, g: g / n, b: b / n }
+  } catch {
+    return null
+  }
+}
+
+export function rgbToCss({ r, g, b }: RGB): string {
+  return `rgb(${Math.round(r)}, ${Math.round(g)}, ${Math.round(b)})`
+}
+
+function colorDist(a: RGB, b: RGB): number {
+  return Math.hypot(a.r - b.r, a.g - b.g, a.b - b.b)
+}
+
+// 2-means clustering, seeded from the previous tick's centroids so team
+// colors stay stable across frames instead of flipping every update.
+export function clusterIntoTeams(
+  colors: RGB[],
+  prevCentroids?: [RGB, RGB]
+): { assignments: number[]; centroids: [RGB, RGB] } {
+  if (colors.length === 0) {
+    return { assignments: [], centroids: prevCentroids ?? [{ r: 200, g: 80, b: 80 }, { r: 80, g: 120, b: 200 }] }
+  }
+  let centroids: [RGB, RGB] = prevCentroids
+    ? [prevCentroids[0], prevCentroids[1]]
+    : colors.length > 1
+      ? [colors[0], colors[colors.length - 1]]
+      : [colors[0], { r: 255 - colors[0].r, g: 255 - colors[0].g, b: 255 - colors[0].b }]
+
+  let assignments = colors.map(() => 0)
+  for (let iter = 0; iter < 4; iter++) {
+    assignments = colors.map((c) => (colorDist(c, centroids[0]) <= colorDist(c, centroids[1]) ? 0 : 1))
+    for (const k of [0, 1] as const) {
+      const members = colors.filter((_, i) => assignments[i] === k)
+      if (members.length > 0) {
+        centroids[k] = {
+          r: members.reduce((a, c) => a + c.r, 0) / members.length,
+          g: members.reduce((a, c) => a + c.g, 0) / members.length,
+          b: members.reduce((a, c) => a + c.b, 0) / members.length,
+        }
+      }
+    }
+  }
+  return { assignments, centroids }
+}
