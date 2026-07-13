@@ -65,6 +65,7 @@ export default function LiveAiTrackerPage() {
   const loopActiveRef = useRef(false)
   const fpsRef = useRef({ frames: 0, last: 0 })
   const lastBallRef = useRef<{ x: number; y: number; t: number } | null>(null)
+  const displayRef = useRef<Record<number, { x: number; y: number; w: number; h: number }>>({})
 
   const [source, setSource] = useState<'none' | 'file' | 'camera'>('none')
   const [fileName, setFileName] = useState('')
@@ -94,6 +95,7 @@ export default function LiveAiTrackerPage() {
   const [fps, setFps] = useState(0)
   const [, setTick] = useState(0)
   const [ballLive, setBallLive] = useState(false)
+  const [videoAspect, setVideoAspect] = useState('16 / 9')
   const [clock, setClock] = useState(0)
   const [activePlayer, setActivePlayer] = useState('')
   const [events, setEvents] = useState<SessionEvent[]>([])
@@ -349,7 +351,25 @@ export default function LiveAiTrackerPage() {
             ? rawDets.filter((d) => d.cls === 'sports ball' || pointInPolygon(d.x + d.w / 2, d.y + d.h, poly))
             : rawDets
           const tracked = trackerRef.current.update(dets)
-          setBoxes(tracked)
+          // Display smoothing: ease player boxes toward their new position to
+          // kill per-frame jitter (the ball is left un-smoothed so it stays
+          // snappy). All the internal math below still uses the raw `tracked`
+          // positions — only the drawn overlay is smoothed.
+          const disp = displayRef.current
+          const smoothed = tracked.map((b) => {
+            if (b.cls === 'sports ball') {
+              disp[b.trackId] = { x: b.x, y: b.y, w: b.w, h: b.h }
+              return b
+            }
+            const prev = disp[b.trackId]
+            const a = 0.55
+            const nb = prev
+              ? { ...b, x: prev.x + (b.x - prev.x) * a, y: prev.y + (b.y - prev.y) * a, w: prev.w + (b.w - prev.w) * a, h: prev.h + (b.h - prev.h) * a }
+              : b
+            disp[b.trackId] = { x: nb.x, y: nb.y, w: nb.w, h: nb.h }
+            return nb
+          })
+          setBoxes(smoothed)
           const t = now()
 
           // Movement accrual for assigned players.
@@ -756,10 +776,22 @@ export default function LiveAiTrackerPage() {
           <div
             ref={boxRef}
             onClick={onOverlayClick}
-            className={`relative bg-black rounded-xl overflow-hidden border border-border ${mode !== 'assign' ? 'cursor-crosshair' : ''}`}
-            style={{ aspectRatio: '16 / 9' }}
+            className={`relative bg-black rounded-xl overflow-hidden border border-border mx-auto ${mode !== 'assign' ? 'cursor-crosshair' : ''}`}
+            style={{ aspectRatio: videoAspect, maxHeight: '70vh' }}
           >
-            <video ref={videoRef} playsInline controls={source === 'file'} className="w-full h-full object-contain" />
+            <video
+              ref={videoRef}
+              playsInline
+              controls={source === 'file'}
+              onLoadedMetadata={(e) => {
+                const v = e.currentTarget
+                // Match the frame to the video's true aspect ratio so the
+                // detection overlay lines up exactly with the picture (no
+                // letterbox offset that would push boxes off the players).
+                if (v.videoWidth && v.videoHeight) setVideoAspect(`${v.videoWidth} / ${v.videoHeight}`)
+              }}
+              className="w-full h-full object-contain"
+            />
             {source === 'none' && (
               <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-6">
                 <p className="text-white/90 font-semibold">No video source</p>
