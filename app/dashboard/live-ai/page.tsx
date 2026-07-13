@@ -24,6 +24,7 @@ import {
   clusterIntoTeams,
   rgbToCss,
   rgbToHex,
+  pointInPolygon,
   PARTICIPANT_PALETTE,
   type DetectedBox,
   type RGB,
@@ -31,7 +32,6 @@ import {
 import { readJerseyNumbers, confirmShotOutcome, captureBurst, extractFramesAt, analyzeFrames, type ShotOutcome, type AiEvent } from '@/lib/basketball/ai'
 
 const fmtClock = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
-const DETECT_INTERVAL_MS = 450
 const HOOP_TRIGGER_RADIUS = 0.07
 const SHOT_COOLDOWN_S = 3
 const AUTO_ENROLL_TICKS = 4 // a track must persist ~2s before auto-enrolling
@@ -51,7 +51,6 @@ export default function LiveAiTrackerPage() {
   const trackerRef = useRef(new CentroidTracker())
   const modelRef = useRef<Awaited<ReturnType<typeof loadDetector>> | null>(null)
   const runningRef = useRef(false)
-  const busyRef = useRef(false)
   const assignmentsRef = useRef<Record<number, string>>({})
   const movementRef = useRef<Record<string, { t: number; x: number; y: number }[]>>({})
   const teamCentroidsRef = useRef<[RGB, RGB] | undefined>(undefined)
@@ -62,6 +61,9 @@ export default function LiveAiTrackerPage() {
   const trackSeenRef = useRef<Record<number, number>>({})
   const lastTorsoRef = useRef<Record<number, RGB>>({})
   const autoEnrollRef = useRef(false)
+  const courtPolyRef = useRef<{ x: number; y: number }[] | null>(null)
+  const loopActiveRef = useRef(false)
+  const fpsRef = useRef({ frames: 0, last: 0 })
 
   const [source, setSource] = useState<'none' | 'file' | 'camera'>('none')
   const [fileName, setFileName] = useState('')
@@ -81,11 +83,14 @@ export default function LiveAiTrackerPage() {
   const [readingJerseys, setReadingJerseys] = useState(false)
   const [jerseyError, setJerseyError] = useState<string | null>(null)
   const [jerseyResult, setJerseyResult] = useState<string | null>(null)
-  const [mode, setMode] = useState<'assign' | 'calibrate' | 'hoop'>('assign')
+  const [mode, setMode] = useState<'assign' | 'calibrate' | 'hoop' | 'court'>('assign')
   const [calPoints, setCalPoints] = useState<{ x: number; y: number }[]>([])
   const [calMeters, setCalMeters] = useState(28)
   const [metersPerUnit, setMetersPerUnit] = useState<number | null>(null)
   const [hoopPoint, setHoopPoint] = useState<{ x: number; y: number } | null>(null)
+  const [courtType, setCourtType] = useState<'full' | 'half'>('full')
+  const [courtPoints, setCourtPoints] = useState<{ x: number; y: number }[]>([])
+  const [fps, setFps] = useState(0)
   const [, setTick] = useState(0)
   const [clock, setClock] = useState(0)
   const [activePlayer, setActivePlayer] = useState('')
@@ -116,6 +121,14 @@ export default function LiveAiTrackerPage() {
   useEffect(() => {
     autoStatScanRef.current = autoStatScan
   }, [autoStatScan])
+  useEffect(() => {
+    // The court region is only active once all 4 corners are marked.
+    courtPolyRef.current = courtPoints.length === 4 ? courtPoints : null
+  }, [courtPoints])
+  useEffect(() => {
+    // Suggest the right reference length for calibration based on court type.
+    setCalMeters(courtType === 'full' ? 28 : 14)
+  }, [courtType])
 
   const now = useCallback((): number => {
     if (source === 'camera') return (Date.now() - camStartRef.current) / 1000
@@ -311,96 +324,122 @@ export default function LiveAiTrackerPage() {
     []
   )
 
-  // Detection loop — runs on an interval so the browser controls pacing;
-  // guarded so a slow detection pass never overlaps the next tick.
+  // Detection loop — runs continuously (each pass schedules the next via
+  // requestAnimationFrame the moment it finishes) so the GPU is used at full
+  // throughput instead of an artificial ~2fps timer. This is what makes the
+  // boxes keep up with fast play so movement data is captured densely.
   useEffect(() => {
     if (!tracking) return
-    const id = setInterval(async () => {
-      if (busyRef.current || !runningRef.current) return
+    loopActiveRef.current = true
+    let raf = 0
+    const loop = async () => {
+      if (!loopActiveRef.current) return
       const video = videoRef.current
       const model = modelRef.current
-      if (!video || !model || video.readyState < 2) return
-      busyRef.current = true
-      try {
-        const dets = await detectFrame(model, video, 0.45)
-        const tracked = trackerRef.current.update(dets)
-        setBoxes(tracked)
-        const t = now()
+      if (video && model && video.readyState >= 2 && runningRef.current) {
+        try {
+          const rawDets = await detectFrame(model, video, 0.4)
+          // On-court vision only: drop anything whose feet (person) or center
+          // (ball) fall outside the marked court region.
+          const poly = courtPolyRef.current
+          const dets = poly
+            ? rawDets.filter((d) =>
+                pointInPolygon(d.x + d.w / 2, d.cls === 'person' ? d.y + d.h : d.y + d.h / 2, poly)
+              )
+            : rawDets
+          const tracked = trackerRef.current.update(dets)
+          setBoxes(tracked)
+          const t = now()
 
-        // Movement accrual for assigned players.
-        for (const b of tracked) {
-          if (b.cls !== 'person') continue
-          const playerId = assignmentsRef.current[b.trackId]
-          if (!playerId) continue
-          const cx = b.x + b.w / 2
-          const cy = b.y + b.h / 2
-          const arr = movementRef.current[playerId] ?? (movementRef.current[playerId] = [])
-          arr.push({ t, x: cx, y: cy })
-        }
-
-        // On-device jersey-color sampling — used both for team separation
-        // and for coloring auto-enrolled participants by their real jersey.
-        const persons = tracked.filter((b) => b.cls === 'person')
-        const torsoByTrack: Record<number, RGB> = {}
-        for (const b of persons) {
-          const c = sampleTorsoColor(video, b)
-          if (c) {
-            torsoByTrack[b.trackId] = c
-            lastTorsoRef.current[b.trackId] = c
+          // Movement accrual for assigned players.
+          for (const b of tracked) {
+            if (b.cls !== 'person') continue
+            const playerId = assignmentsRef.current[b.trackId]
+            if (!playerId) continue
+            const cx = b.x + b.w / 2
+            const cy = b.y + b.h / 2
+            const arr = movementRef.current[playerId] ?? (movementRef.current[playerId] = [])
+            arr.push({ t, x: cx, y: cy })
           }
-        }
-        const colorEntries = persons.filter((b) => torsoByTrack[b.trackId])
-        const colors = colorEntries.map((b) => torsoByTrack[b.trackId])
-        if (colors.length > 0) {
-          const { assignments: clusterAssign, centroids } = clusterIntoTeams(colors, teamCentroidsRef.current)
-          teamCentroidsRef.current = centroids
-          setTeamColors(centroids)
-          const map: Record<number, number> = {}
-          colorEntries.forEach((b, i) => {
-            map[b.trackId] = clusterAssign[i]
-          })
-          setTeamIndexByTrack(map)
-        }
 
-        // Auto-enroll: any person the GPU has tracked steadily for a moment
-        // becomes a numbered, colored participant on its own, and starts
-        // collecting movement data — no manual step.
-        if (autoEnrollRef.current) {
+          // On-device jersey-color sampling — used both for team separation
+          // and for coloring auto-enrolled participants by their real jersey.
+          const persons = tracked.filter((b) => b.cls === 'person')
+          const torsoByTrack: Record<number, RGB> = {}
           for (const b of persons) {
-            if (assignmentsRef.current[b.trackId]) continue
-            const seen = (trackSeenRef.current[b.trackId] = (trackSeenRef.current[b.trackId] ?? 0) + 1)
-            if (seen === AUTO_ENROLL_TICKS) {
-              const torso = lastTorsoRef.current[b.trackId]
-              const color = torso ? rgbToHex(torso) : PARTICIPANT_PALETTE[getDB().roster.length % PARTICIPANT_PALETTE.length]
-              createParticipant(b.trackId, { number: peekFreeNumber(), color })
+            const c = sampleTorsoColor(video, b)
+            if (c) {
+              torsoByTrack[b.trackId] = c
+              lastTorsoRef.current[b.trackId] = c
             }
           }
-        }
+          const colorEntries = persons.filter((b) => torsoByTrack[b.trackId])
+          const colors = colorEntries.map((b) => torsoByTrack[b.trackId])
+          if (colors.length > 0) {
+            const { assignments: clusterAssign, centroids } = clusterIntoTeams(colors, teamCentroidsRef.current)
+            teamCentroidsRef.current = centroids
+            setTeamColors(centroids)
+            const map: Record<number, number> = {}
+            colorEntries.forEach((b, i) => {
+              map[b.trackId] = clusterAssign[i]
+            })
+            setTeamIndexByTrack(map)
+          }
 
-        // Ball-near-hoop heuristic — a cheap, on-device trigger for the
-        // (rate-limited) AI confirmation step, not a made/miss call itself.
-        const ball = tracked.find((b) => b.cls === 'sports ball')
-        if (ball) {
-          const cx = ball.x + ball.w / 2
-          const cy = ball.y + ball.h / 2
-          const hist = ballHistoryRef.current
-          hist.push({ t, x: cx, y: cy })
-          if (hist.length > 10) hist.shift()
-          const hoop = hoopPointRef.current
-          if (hoop && hist.length >= 2 && t - lastShotCheckRef.current > SHOT_COOLDOWN_S) {
-            const dist = Math.hypot(cx - hoop.x, cy - hoop.y)
-            if (dist < HOOP_TRIGGER_RADIUS) {
-              handleCandidateShot(t, analyzeMake(hoop))
+          // Auto-enroll: any person the GPU has tracked steadily for a moment
+          // becomes a numbered, colored participant on its own, and starts
+          // collecting movement data — no manual step.
+          if (autoEnrollRef.current) {
+            for (const b of persons) {
+              if (assignmentsRef.current[b.trackId]) continue
+              const seen = (trackSeenRef.current[b.trackId] = (trackSeenRef.current[b.trackId] ?? 0) + 1)
+              if (seen === AUTO_ENROLL_TICKS) {
+                const torso = lastTorsoRef.current[b.trackId]
+                const color = torso ? rgbToHex(torso) : PARTICIPANT_PALETTE[getDB().roster.length % PARTICIPANT_PALETTE.length]
+                createParticipant(b.trackId, { number: peekFreeNumber(), color })
+              }
             }
           }
-        }
 
-        setTick((c) => c + 1)
-      } finally {
-        busyRef.current = false
+          // Ball-near-hoop heuristic — a cheap, on-device trigger for the
+          // (rate-limited) AI confirmation step, not a made/miss call itself.
+          const ball = tracked.find((b) => b.cls === 'sports ball')
+          if (ball) {
+            const cx = ball.x + ball.w / 2
+            const cy = ball.y + ball.h / 2
+            const hist = ballHistoryRef.current
+            hist.push({ t, x: cx, y: cy })
+            if (hist.length > 16) hist.shift()
+            const hoop = hoopPointRef.current
+            if (hoop && hist.length >= 2 && t - lastShotCheckRef.current > SHOT_COOLDOWN_S) {
+              const dist = Math.hypot(cx - hoop.x, cy - hoop.y)
+              if (dist < HOOP_TRIGGER_RADIUS) {
+                handleCandidateShot(t, analyzeMake(hoop))
+              }
+            }
+          }
+
+          // FPS meter (also drives the movement/stat readout re-render).
+          const nowMs = performance.now()
+          const f = fpsRef.current
+          f.frames++
+          if (nowMs - f.last >= 1000) {
+            setFps(f.frames)
+            setTick((c) => c + 1)
+            f.frames = 0
+            f.last = nowMs
+          }
+        } catch {
+          // transient WebGL / decode hiccup — next frame continues
+        }
       }
-    }, DETECT_INTERVAL_MS)
-    return () => clearInterval(id)
+      raf = requestAnimationFrame(loop)
+    }
+    raf = requestAnimationFrame(loop)
+    return () => {
+      loopActiveRef.current = false
+      cancelAnimationFrame(raf)
+    }
   }, [tracking, now, handleCandidateShot, analyzeMake, createParticipant, peekFreeNumber])
 
   const addTag = useCallback(
@@ -453,6 +492,9 @@ export default function LiveAiTrackerPage() {
       })
     } else if (mode === 'hoop') {
       setHoopPoint({ x, y })
+    } else if (mode === 'court') {
+      // Collect up to 4 corners of the court region (clockwise from a corner).
+      setCourtPoints((prev) => (prev.length >= 4 ? [{ x, y }] : [...prev, { x, y }]))
     }
   }
 
@@ -722,6 +764,19 @@ export default function LiveAiTrackerPage() {
               </div>
             )}
             <svg className="absolute inset-0 w-full h-full" viewBox="0 0 100 100" preserveAspectRatio="none">
+              {/* Court region: filled outline when complete, dots while marking */}
+              {courtPoints.length >= 2 && (
+                <polygon
+                  points={courtPoints.map((p) => `${p.x * 100},${p.y * 100}`).join(' ')}
+                  fill={courtPoints.length === 4 ? 'rgba(34,197,94,0.06)' : 'none'}
+                  stroke="#22c55e"
+                  strokeWidth="0.4"
+                  strokeDasharray="1.5 1"
+                />
+              )}
+              {courtPoints.map((p, i) => (
+                <circle key={`court-${i}`} cx={p.x * 100} cy={p.y * 100} r="0.9" fill="#22c55e" />
+              ))}
               {calPoints.length === 2 && (
                 <line x1={calPoints[0].x * 100} y1={calPoints[0].y * 100} x2={calPoints[1].x * 100} y2={calPoints[1].y * 100} stroke="#facc15" strokeWidth="0.4" strokeDasharray="1.5 1" />
               )}
@@ -779,22 +834,47 @@ export default function LiveAiTrackerPage() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2 mt-3">
-            {([['assign', 'Assign mode'], ['calibrate', 'Calibrate court'], ['hoop', 'Mark hoop']] as const).map(([m, label]) => (
+            {([['assign', 'Assign mode'], ['court', 'Mark court'], ['calibrate', 'Calibrate court'], ['hoop', 'Mark hoop']] as const).map(([m, label]) => (
               <button key={m} type="button" onClick={() => setMode(m)}
                 className={`px-3.5 py-2 text-sm font-medium rounded-lg border ${mode === m ? 'border-orange-500 bg-orange-500/10 text-orange-500' : 'border-border text-muted-foreground hover:text-foreground'}`}>
                 {label}
               </button>
             ))}
+            <div className="flex items-center gap-1 text-xs">
+              {(['full', 'half'] as const).map((ct) => (
+                <button key={ct} type="button" onClick={() => setCourtType(ct)}
+                  className={`px-2.5 py-1.5 rounded-lg border ${courtType === ct ? 'border-orange-500 bg-orange-500/10 text-orange-500' : 'border-border text-muted-foreground hover:text-foreground'}`}>
+                  {ct === 'full' ? 'Full court' : 'Half court'}
+                </button>
+              ))}
+            </div>
+            {tracking && (
+              <span className="text-xs px-2.5 py-1 rounded-full bg-blue-500/10 text-blue-500 tabular-nums">{fps} fps</span>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 mt-2">
             {mode === 'assign' && <span className="text-xs text-muted-foreground">Click a box to name it.</span>}
+            {mode === 'court' && (
+              <span className="flex items-center gap-2 text-xs text-muted-foreground">
+                Click the 4 corners of the {courtType === 'full' ? 'full' : 'half'} court ({courtPoints.length}/4) — only players inside are tracked.
+                {courtPoints.length > 0 && (
+                  <button type="button" onClick={() => setCourtPoints([])} className="text-red-500 hover:underline">clear</button>
+                )}
+              </span>
+            )}
             {mode === 'calibrate' && (
               <span className="flex items-center gap-2 text-xs text-muted-foreground">
                 Click 2 court points spanning
                 <input type="number" min={1} max={40} value={calMeters} onChange={(e) => setCalMeters(Number(e.target.value) || 28)}
                   className="w-16 px-2 py-1 rounded border border-border bg-background text-foreground" />
-                meters
+                meters ({courtType === 'full' ? 'full = 28m length' : 'half = 14m length'})
               </span>
             )}
             {mode === 'hoop' && <span className="text-xs text-muted-foreground">Click the rim once — enables automatic shot detection.</span>}
+            <span className={`text-xs px-2.5 py-1 rounded-full ${courtPoints.length === 4 ? 'bg-green-500/10 text-green-500' : 'bg-yellow-500/10 text-yellow-500'}`}>
+              {courtPoints.length === 4 ? 'On-court region set' : 'Whole frame (mark court to focus)'}
+            </span>
             <span className={`text-xs px-2.5 py-1 rounded-full ${metersPerUnit ? 'bg-green-500/10 text-green-500' : 'bg-yellow-500/10 text-yellow-500'}`}>
               {metersPerUnit ? 'Court calibrated' : 'Not calibrated'}
             </span>

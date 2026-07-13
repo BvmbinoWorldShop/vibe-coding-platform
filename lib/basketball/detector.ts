@@ -48,19 +48,23 @@ interface TrackState {
   cls: string
   cx: number
   cy: number
+  vx: number
+  vy: number
   w: number
   h: number
   lastSeen: number
   missCount: number
 }
 
-// Simple nearest-centroid multi-object tracker. Good enough to keep a
-// human-assigned name attached to the same moving box between detection
-// passes (tracking, not identification).
+// Nearest-centroid multi-object tracker with constant-velocity prediction.
+// Matching a detection against each track's *predicted* next position (not
+// its last one) lets identities survive fast movement between frames, and
+// coasting a briefly-missed track along its velocity keeps the box moving
+// with the player instead of freezing until the next detection.
 export class CentroidTracker {
   private tracks: TrackState[] = []
   private nextId = 1
-  private maxMiss = 8
+  private maxMiss = 12
   private frame = 0
 
   update(
@@ -70,6 +74,12 @@ export class CentroidTracker {
     const used = new Set<number>()
     const results: DetectedBox[] = []
 
+    // Predict every track forward one step before matching.
+    for (const t of this.tracks) {
+      t.cx += t.vx
+      t.cy += t.vy
+    }
+
     for (const det of detections) {
       const cx = det.x + det.w / 2
       const cy = det.y + det.h / 2
@@ -78,13 +88,21 @@ export class CentroidTracker {
       for (const t of this.tracks) {
         if (used.has(t.id) || t.cls !== det.cls) continue
         const dist = Math.hypot(t.cx - cx, t.cy - cy)
-        const gate = det.cls === 'sports ball' ? 0.12 : 0.18
+        // Wider gates than a static tracker, scaled up while a track is
+        // temporarily unmatched so a fast player isn't dropped mid-drive.
+        const base = det.cls === 'sports ball' ? 0.16 : 0.24
+        const gate = base * (1 + Math.min(t.missCount, 4) * 0.4)
         if (dist < gate && dist < bestDist) {
           best = t
           bestDist = dist
         }
       }
       if (best) {
+        // Velocity update (EMA) toward the new observation, then snap to it.
+        const nvx = cx - best.cx
+        const nvy = cy - best.cy
+        best.vx = best.vx * 0.5 + nvx * 0.5
+        best.vy = best.vy * 0.5 + nvy * 0.5
         best.cx = cx
         best.cy = cy
         best.w = det.w
@@ -94,16 +112,25 @@ export class CentroidTracker {
         used.add(best.id)
         results.push({ trackId: best.id, cls: det.cls, x: det.x, y: det.y, w: det.w, h: det.h, score: det.score })
       } else {
-        const t: TrackState = { id: this.nextId++, cls: det.cls, cx, cy, w: det.w, h: det.h, lastSeen: this.frame, missCount: 0 }
+        const t: TrackState = { id: this.nextId++, cls: det.cls, cx, cy, vx: 0, vy: 0, w: det.w, h: det.h, lastSeen: this.frame, missCount: 0 }
         this.tracks.push(t)
         used.add(t.id)
         results.push({ trackId: t.id, cls: det.cls, x: det.x, y: det.y, w: det.w, h: det.h, score: det.score })
       }
     }
 
-    // Age out unmatched tracks.
+    // Unmatched tracks: coast along velocity (with damping) and emit a
+    // predicted box so the overlay keeps moving; age them out after a bit.
     for (const t of this.tracks) {
-      if (!used.has(t.id)) t.missCount++
+      if (used.has(t.id)) continue
+      t.missCount++
+      t.vx *= 0.8
+      t.vy *= 0.8
+      if (t.missCount <= 4) {
+        const x = Math.max(0, Math.min(1 - t.w, t.cx - t.w / 2))
+        const y = Math.max(0, Math.min(1 - t.h, t.cy - t.h / 2))
+        results.push({ trackId: t.id, cls: t.cls as 'person' | 'sports ball', x, y, w: t.w, h: t.h, score: 0.3 })
+      }
     }
     this.tracks = this.tracks.filter((t) => t.missCount <= this.maxMiss)
 
@@ -115,6 +142,21 @@ export class CentroidTracker {
     this.nextId = 1
     this.frame = 0
   }
+}
+
+// Point-in-polygon (ray casting) for the on-court region mask. Detections
+// whose feet fall outside the marked court are ignored, so the GPU/AI never
+// spend effort on the crowd, bench, or sideline.
+export function pointInPolygon(px: number, py: number, poly: { x: number; y: number }[]): boolean {
+  if (poly.length < 3) return true
+  let inside = false
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x, yi = poly[i].y
+    const xj = poly[j].x, yj = poly[j].y
+    const intersect = yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi
+    if (intersect) inside = !inside
+  }
+  return inside
 }
 
 export async function detectFrame(
