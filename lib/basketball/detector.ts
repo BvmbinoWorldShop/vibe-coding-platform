@@ -121,18 +121,21 @@ export class CentroidTracker {
 
     // Unmatched tracks: coast along velocity (with damping) and emit a
     // predicted box so the overlay keeps moving; age them out after a bit.
+    // The ball coasts longer than people so it is virtually never "lost".
     for (const t of this.tracks) {
       if (used.has(t.id)) continue
       t.missCount++
-      t.vx *= 0.8
-      t.vy *= 0.8
-      if (t.missCount <= 4) {
+      t.vx *= 0.85
+      t.vy *= 0.85
+      const coastLimit = t.cls === 'sports ball' ? 12 : 4
+      if (t.missCount <= coastLimit) {
         const x = Math.max(0, Math.min(1 - t.w, t.cx - t.w / 2))
         const y = Math.max(0, Math.min(1 - t.h, t.cy - t.h / 2))
-        results.push({ trackId: t.id, cls: t.cls as 'person' | 'sports ball', x, y, w: t.w, h: t.h, score: 0.3 })
+        results.push({ trackId: t.id, cls: t.cls as 'person' | 'sports ball', x, y, w: t.w, h: t.h, score: 0.25 })
       }
     }
-    this.tracks = this.tracks.filter((t) => t.missCount <= this.maxMiss)
+    const maxMiss = this.maxMiss
+    this.tracks = this.tracks.filter((t) => t.missCount <= (t.cls === 'sports ball' ? 30 : maxMiss))
 
     return results
   }
@@ -162,13 +165,20 @@ export function pointInPolygon(px: number, py: number, poly: { x: number; y: num
 export async function detectFrame(
   model: CocoModel,
   source: HTMLVideoElement,
-  minScore = 0.4
+  personMin = 0.4,
+  // The ball is small and fast, so it scores lower than people — use a much
+  // lower threshold for it so it is caught (and kept) far more often. This is
+  // what keeps the ball recognized nearly every frame.
+  ballMin = 0.18
 ): Promise<{ cls: 'person' | 'sports ball'; x: number; y: number; w: number; h: number; score: number }[]> {
   const preds = await model.detect(source)
   const vw = source.videoWidth || 1
   const vh = source.videoHeight || 1
   return preds
-    .filter((p) => (p.class === 'person' || p.class === 'sports ball') && p.score >= minScore)
+    .filter((p) =>
+      (p.class === 'person' && p.score >= personMin) ||
+      (p.class === 'sports ball' && p.score >= ballMin)
+    )
     .map((p) => ({
       cls: p.class as 'person' | 'sports ball',
       x: p.bbox[0] / vw,

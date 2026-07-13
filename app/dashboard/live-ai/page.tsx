@@ -64,6 +64,7 @@ export default function LiveAiTrackerPage() {
   const courtPolyRef = useRef<{ x: number; y: number }[] | null>(null)
   const loopActiveRef = useRef(false)
   const fpsRef = useRef({ frames: 0, last: 0 })
+  const lastBallRef = useRef<{ x: number; y: number; t: number } | null>(null)
 
   const [source, setSource] = useState<'none' | 'file' | 'camera'>('none')
   const [fileName, setFileName] = useState('')
@@ -92,6 +93,7 @@ export default function LiveAiTrackerPage() {
   const [courtPoints, setCourtPoints] = useState<{ x: number; y: number }[]>([])
   const [fps, setFps] = useState(0)
   const [, setTick] = useState(0)
+  const [ballLive, setBallLive] = useState(false)
   const [clock, setClock] = useState(0)
   const [activePlayer, setActivePlayer] = useState('')
   const [events, setEvents] = useState<SessionEvent[]>([])
@@ -338,14 +340,13 @@ export default function LiveAiTrackerPage() {
       const model = modelRef.current
       if (video && model && video.readyState >= 2 && runningRef.current) {
         try {
-          const rawDets = await detectFrame(model, video, 0.4)
-          // On-court vision only: drop anything whose feet (person) or center
-          // (ball) fall outside the marked court region.
+          const rawDets = await detectFrame(model, video, 0.4, 0.18)
+          // On-court vision only for people (drop crowd/bench by feet position),
+          // but the ball is NEVER filtered — it flies above the rim and past
+          // the sidelines, and we want it recognized at all times.
           const poly = courtPolyRef.current
           const dets = poly
-            ? rawDets.filter((d) =>
-                pointInPolygon(d.x + d.w / 2, d.cls === 'person' ? d.y + d.h : d.y + d.h / 2, poly)
-              )
+            ? rawDets.filter((d) => d.cls === 'sports ball' || pointInPolygon(d.x + d.w / 2, d.y + d.h, poly))
             : rawDets
           const tracked = trackerRef.current.update(dets)
           setBoxes(tracked)
@@ -407,6 +408,7 @@ export default function LiveAiTrackerPage() {
           if (ball) {
             const cx = ball.x + ball.w / 2
             const cy = ball.y + ball.h / 2
+            lastBallRef.current = { x: cx, y: cy, t }
             const hist = ballHistoryRef.current
             hist.push({ t, x: cx, y: cy })
             if (hist.length > 16) hist.shift()
@@ -425,6 +427,7 @@ export default function LiveAiTrackerPage() {
           f.frames++
           if (nowMs - f.last >= 1000) {
             setFps(f.frames)
+            setBallLive(lastBallRef.current != null && t - lastBallRef.current.t < 1.5)
             setTick((c) => c + 1)
             f.frames = 0
             f.last = nowMs
@@ -851,6 +854,12 @@ export default function LiveAiTrackerPage() {
             {tracking && (
               <span className="text-xs px-2.5 py-1 rounded-full bg-blue-500/10 text-blue-500 tabular-nums">{fps} fps</span>
             )}
+            {tracking && (
+              <span className={`text-xs px-2.5 py-1 rounded-full flex items-center gap-1.5 ${ballLive ? 'bg-orange-500/10 text-orange-500' : 'bg-muted text-muted-foreground'}`}>
+                <span className={`w-1.5 h-1.5 rounded-full ${ballLive ? 'bg-orange-500' : 'bg-muted-foreground'}`} />
+                {ballLive ? 'Ball tracked' : 'Ball searching…'}
+              </span>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-2 mt-2">
@@ -1112,7 +1121,13 @@ export default function LiveAiTrackerPage() {
             <h2 className="text-sm font-semibold text-foreground mb-3">Live Court</h2>
             <LiveCourt
               playerPositions={courtPositions}
-              ballPosition={ballBox ? { x: (ballBox.x + ballBox.w / 2) * 100, y: (ballBox.y + ballBox.h / 2) * 100 } : { x: 50, y: 50 }}
+              ballPosition={
+                ballBox
+                  ? { x: (ballBox.x + ballBox.w / 2) * 100, y: (ballBox.y + ballBox.h / 2) * 100 }
+                  : lastBallRef.current
+                    ? { x: lastBallRef.current.x * 100, y: lastBallRef.current.y * 100 }
+                    : { x: 50, y: 50 }
+              }
             />
           </div>
         </div>
