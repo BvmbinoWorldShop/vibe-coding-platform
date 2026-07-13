@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { useDB, updateDB, type GameSession, type RosterPlayer } from '@/lib/basketball/store'
@@ -21,8 +21,31 @@ export default function ProEnginePage() {
   const [progress, setProgress] = useState(0)
   const [statusMsg, setStatusMsg] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const [health, setHealth] = useState<'checking' | 'ok' | 'cv-missing' | 'unreachable'>('checking')
 
   const engineUrl = db.settings.proEngineUrl
+  // Browsers block an https page from calling http://localhost — the #1
+  // silent reason the engine "doesn't work" when the app is on its live URL.
+  const mixedContent =
+    typeof window !== 'undefined' &&
+    window.location.protocol === 'https:' &&
+    engineUrl.startsWith('http://')
+
+  useEffect(() => {
+    if (!engineUrl) return
+    let cancelled = false
+    setHealth('checking')
+    fetch(`${engineUrl}/health`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (cancelled) return
+        setHealth(d.status === 'ok' ? (d.cv_ready ? 'ok' : 'cv-missing') : 'unreachable')
+      })
+      .catch(() => !cancelled && setHealth('unreachable'))
+    return () => {
+      cancelled = true
+    }
+  }, [engineUrl])
 
   async function runAnalysis() {
     if (!file || !engineUrl) return
@@ -94,7 +117,44 @@ export default function ProEnginePage() {
         metric movement. The result imports as a normal game — all your analytics, search and reports
         work on it.
       </p>
-      <p className="text-xs text-muted-foreground mb-6">Engine: <code>{engineUrl}</code></p>
+      <p className="text-xs text-muted-foreground mb-4">Engine: <code>{engineUrl}</code></p>
+
+      {/* Live connection diagnostics — tells you exactly why it isn't working */}
+      {mixedContent ? (
+        <div className="bg-red-500/10 border border-red-500/40 rounded-xl p-4 mb-5 text-sm">
+          <p className="font-semibold text-red-500 mb-1">Your browser is blocking the engine (mixed content)</p>
+          <p className="text-muted-foreground text-xs leading-relaxed">
+            This app is open over <b>https</b>, and browsers refuse to let an https page call an
+            <b> http://localhost</b> address. Fix by opening the app locally over http instead: on the
+            machine running the engine, run the web app with <code>pnpm dev</code> and use{' '}
+            <code>http://localhost:3000</code>. (Or put the engine behind https.)
+          </p>
+        </div>
+      ) : health === 'unreachable' ? (
+        <div className="bg-red-500/10 border border-red-500/40 rounded-xl p-4 mb-5 text-sm">
+          <p className="font-semibold text-red-500 mb-1">Can&apos;t reach the engine at {engineUrl}</p>
+          <p className="text-muted-foreground text-xs leading-relaxed">
+            The Python backend isn&apos;t responding. On the machine with your GPU, from the{' '}
+            <code>tracking-engine/</code> folder, start it with{' '}
+            <code>uvicorn app.main:app --host 0.0.0.0 --port 8000</code>, then reload this page.
+            Verify with <code>curl {engineUrl}/health</code>.
+          </p>
+        </div>
+      ) : health === 'cv-missing' ? (
+        <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-xl p-4 mb-5 text-sm">
+          <p className="font-semibold text-yellow-600 dark:text-yellow-400 mb-1">Engine is up, but the CV libraries aren&apos;t installed</p>
+          <p className="text-muted-foreground text-xs leading-relaxed">
+            Run <code>pip install -r requirements.txt</code> in <code>tracking-engine/</code> (installs
+            YOLOv8/torch/opencv), then restart the engine.
+          </p>
+        </div>
+      ) : health === 'ok' ? (
+        <div className="bg-green-500/10 border border-green-500/40 rounded-xl p-4 mb-5 text-sm">
+          <p className="font-semibold text-green-500">Engine connected — ready to analyze.</p>
+        </div>
+      ) : (
+        <div className="bg-muted/40 border border-border rounded-xl p-4 mb-5 text-sm text-muted-foreground">Checking engine connection…</div>
+      )}
 
       <div className="bg-card border border-border rounded-xl p-5 mb-5 space-y-4">
         <div>
@@ -122,10 +182,16 @@ export default function ProEnginePage() {
             </select>
           </div>
         </div>
-        <button type="button" onClick={runAnalysis} disabled={!file || busy}
-          className="px-6 py-2.5 text-sm font-semibold rounded-lg bg-orange-600 text-white hover:bg-orange-500 disabled:opacity-40">
-          {busy ? 'Analyzing…' : 'Analyze on GPU'}
-        </button>
+        <div className="flex flex-wrap items-center gap-3">
+          <button type="button" onClick={runAnalysis} disabled={!file || busy || health !== 'ok'}
+            className="px-6 py-2.5 text-sm font-semibold rounded-lg bg-orange-600 text-white hover:bg-orange-500 disabled:opacity-40">
+            {busy ? 'Analyzing…' : 'Analyze on GPU'}
+          </button>
+          {!file && <span className="text-xs text-muted-foreground">Choose a video file first.</span>}
+          {file && health !== 'ok' && !busy && (
+            <span className="text-xs text-muted-foreground">Connect the engine first (see the banner above).</span>
+          )}
+        </div>
       </div>
 
       {busy && (
