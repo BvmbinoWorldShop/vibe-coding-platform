@@ -10,7 +10,9 @@ Cerebras keys are only used for the optional *reasoning* layer (coaching reads).
 | Capability | How |
 |---|---|
 | Player + ball detection | **YOLOv8** (COCO `person` + `sports ball`), pick `n/s/m/x` for speed↔accuracy |
-| Stable player IDs through contact/occlusion | **ByteTrack** multi-object tracker (`bytetrack.yaml`) |
+| Stable player IDs through contact/occlusion | **BoT-SORT + appearance ReID** (`botsort.yaml`) — re-identifies players who cross or get occluded instead of swapping IDs |
+| Real jersey numbers | **EasyOCR** reads the number off each player and locks the track to it; tracks that share a number are merged (re-ID across any ID break) |
+| Team separation | Torso-color **2-means clustering** → Team A / Team B, each player carries their real jersey color |
 | Real speed / distance / strides | **Homography** from 4 marked court corners → metric court space |
 | Shot make/miss + attribution | Ball-vs-rim trajectory, attributed to the nearest player |
 | Output | A `GameSession` JSON that imports directly into the web dashboard |
@@ -78,7 +80,8 @@ Corners and hoop are optional: without corners you still get tracking + events
 ## Roadmap (open-source, still free)
 
 - Pose model (YOLOv8-pose) for shot mechanics, screens, box-outs
-- Team classification by jersey-color clustering (already in the web app; can
-  move server-side for consistency)
-- Jersey OCR (EasyOCR) to auto-number players — dependency is included, commented
 - Possession & lineup segmentation from ball ownership over time
+- Fine-tuning YOLO on labeled basketball footage for the last accuracy mile
+
+Already included: BoT-SORT ReID, jersey-number OCR, and team-color clustering
+(the identity foundation that makes per-player stats trustworthy).

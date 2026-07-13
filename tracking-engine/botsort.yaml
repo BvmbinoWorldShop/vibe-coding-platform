@@ -1,0 +1,21 @@
+# BoT-SORT with appearance ReID — the accuracy upgrade over plain ByteTrack.
+# The ReID embedding lets a player who is occluded or crosses another player
+# keep their identity instead of swapping IDs, which is the single biggest
+# driver of trustworthy per-player stats. Tuned for basketball (long buffer so
+# IDs survive screens/contact).
+tracker_type: botsort
+track_high_thresh: 0.5
+track_low_thresh: 0.1
+new_track_thresh: 0.6
+track_buffer: 90
+match_thresh: 0.85
+fuse_score: true
+
+# Global motion compensation for a moving/handheld camera.
+gmc_method: sparseOptFlow
+
+# Appearance ReID.
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+with_reid: true
+model: auto

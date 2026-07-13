@@ -11,5 +11,7 @@ ultralytics==8.3.58
 opencv-python-headless==4.10.0.84
 numpy==2.2.1
 
-# Optional: on-device jersey OCR. Uncomment to enable (large-ish download).
-# easyocr==1.7.2
+# On-device jersey-number OCR (used by the identity pass). If you want a
+# lighter install, comment this out — the pipeline falls back to sequential
+# numbering automatically.
+easyocr==1.7.2
