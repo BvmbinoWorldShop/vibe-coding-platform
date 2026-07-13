@@ -192,6 +192,110 @@ export async function detectFrame(
     }))
 }
 
+// ---------- color-based basketball detector ----------
+// COCO-SSD's "sports ball" class is unreliable for a basketball (it was mostly
+// trained on soccer/tennis balls). A basketball's saturated orange, however, is
+// easy to find directly in the pixels — so we detect it by color+shape every
+// frame. This follows the ball far more reliably than the model, needs no
+// download, and is what makes shot detection actually fire.
+
+export interface BallDetection { x: number; y: number; w: number; h: number; score: number }
+
+let ballCanvas: HTMLCanvasElement | null = null
+
+// Returns the ball as normalized box coords (0..1), or null. `prev` (last
+// known normalized center) biases toward the nearest candidate so an orange
+// jersey across the court doesn't steal the ball.
+export function detectBallByColor(
+  video: HTMLVideoElement,
+  prev?: { x: number; y: number } | null
+): BallDetection | null {
+  const vw = video.videoWidth
+  const vh = video.videoHeight
+  if (!vw || !vh) return null
+  if (!ballCanvas) ballCanvas = document.createElement('canvas')
+  const cw = 200
+  const ch = Math.max(1, Math.round((cw * vh) / vw))
+  ballCanvas.width = cw
+  ballCanvas.height = ch
+  const ctx = ballCanvas.getContext('2d', { willReadFrequently: true })
+  if (!ctx) return null
+  try {
+    ctx.drawImage(video, 0, 0, cw, ch)
+    const { data } = ctx.getImageData(0, 0, cw, ch)
+    // Coarse grid of orange pixels → connected clusters via a simple label
+    // grid, then pick the most ball-like compact cluster (optionally nearest
+    // to the previous position).
+    const mask = new Uint8Array(cw * ch)
+    for (let i = 0, px = 0; i < data.length; i += 4, px++) {
+      const r = data[i], g = data[i + 1], b = data[i + 2]
+      // Basketball orange: red-dominant, green clearly above blue, saturated.
+      const max = Math.max(r, g, b)
+      const min = Math.min(r, g, b)
+      const sat = max === 0 ? 0 : (max - min) / max
+      if (r > 95 && g > 45 && r > g * 1.25 && g > b * 1.1 && sat > 0.45 && r - b > 55) {
+        mask[px] = 1
+      }
+    }
+    // Cluster with a flood fill over the small grid.
+    const seen = new Uint8Array(cw * ch)
+    let best: { cx: number; cy: number; n: number; minX: number; maxX: number; minY: number; maxY: number } | null = null
+    let bestScore = -Infinity
+    const stack: number[] = []
+    for (let s = 0; s < mask.length; s++) {
+      if (!mask[s] || seen[s]) continue
+      stack.length = 0
+      stack.push(s)
+      seen[s] = 1
+      let n = 0, sumX = 0, sumY = 0, minX = cw, maxX = 0, minY = ch, maxY = 0
+      while (stack.length) {
+        const p = stack.pop() as number
+        const x = p % cw
+        const y = (p / cw) | 0
+        n++; sumX += x; sumY += y
+        if (x < minX) minX = x
+        if (x > maxX) maxX = x
+        if (y < minY) minY = y
+        if (y > maxY) maxY = y
+        // 4-neighbours
+        if (x > 0 && mask[p - 1] && !seen[p - 1]) { seen[p - 1] = 1; stack.push(p - 1) }
+        if (x < cw - 1 && mask[p + 1] && !seen[p + 1]) { seen[p + 1] = 1; stack.push(p + 1) }
+        if (y > 0 && mask[p - cw] && !seen[p - cw]) { seen[p - cw] = 1; stack.push(p - cw) }
+        if (y < ch - 1 && mask[p + cw] && !seen[p + cw]) { seen[p + cw] = 1; stack.push(p + cw) }
+      }
+      const bw = maxX - minX + 1
+      const bh = maxY - minY + 1
+      // Ball-like: a handful of pixels, compact, roughly square, not huge.
+      if (n < 4 || bw > cw * 0.2 || bh > ch * 0.2) continue
+      const fill = n / (bw * bh)
+      const aspect = bw / bh
+      if (fill < 0.35 || aspect < 0.4 || aspect > 2.5) continue
+      const cx = sumX / n / cw
+      const cy = sumY / n / ch
+      // Score prefers denser blobs and, if we had a previous position, ones
+      // close to it (temporal continuity).
+      let score = n + fill * 20
+      if (prev) score -= Math.hypot(cx - prev.x, cy - prev.y) * 120
+      if (score > bestScore) {
+        bestScore = score
+        best = { cx, cy, n, minX, maxX, minY, maxY }
+      }
+    }
+    if (!best) return null
+    const bw = (best.maxX - best.minX + 1) / cw
+    const bh = (best.maxY - best.minY + 1) / ch
+    return {
+      x: best.cx - bw / 2,
+      y: best.cy - bh / 2,
+      w: Math.max(bw, 0.02),
+      h: Math.max(bh, 0.02),
+      score: Math.min(1, best.n / 40),
+    }
+  } catch {
+    return null
+  }
+}
+
 // ---------- jersey-color team separation ----------
 // Genuinely on-device, no API calls: sample the average jersey color from
 // the torso region of each person box, then run 2-means clustering across
