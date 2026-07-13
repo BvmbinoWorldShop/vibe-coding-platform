@@ -187,6 +187,18 @@ export function rgbToCss({ r, g, b }: RGB): string {
   return `rgb(${Math.round(r)}, ${Math.round(g)}, ${Math.round(b)})`
 }
 
+export function rgbToHex({ r, g, b }: RGB): string {
+  const h = (v: number) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')
+  return `#${h(r)}${h(g)}${h(b)}`
+}
+
+// Distinct, high-contrast fallback colors for ad-hoc participants (pickup /
+// streetball, where players aren't on a defined team). Cycled by index.
+export const PARTICIPANT_PALETTE = [
+  '#f97316', '#22c55e', '#3b82f6', '#eab308', '#ec4899',
+  '#a855f7', '#14b8a6', '#ef4444', '#84cc16', '#06b6d4',
+]
+
 function colorDist(a: RGB, b: RGB): number {
   return Math.hypot(a.r - b.r, a.g - b.g, a.b - b.b)
 }

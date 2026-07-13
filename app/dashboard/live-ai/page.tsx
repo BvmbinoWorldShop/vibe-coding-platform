@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation'
 import { LiveCourt } from '@/components/basketball/court'
 import {
   useDB,
+  getDB,
   updateDB,
   uid,
   statLine,
@@ -22,15 +23,18 @@ import {
   sampleTorsoColor,
   clusterIntoTeams,
   rgbToCss,
+  rgbToHex,
+  PARTICIPANT_PALETTE,
   type DetectedBox,
   type RGB,
 } from '@/lib/basketball/detector'
-import { readJerseyNumbers, confirmShotOutcome, captureBurst, extractFramesAt, type ShotOutcome } from '@/lib/basketball/ai'
+import { readJerseyNumbers, confirmShotOutcome, captureBurst, extractFramesAt, analyzeFrames, type ShotOutcome, type AiEvent } from '@/lib/basketball/ai'
 
 const fmtClock = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
 const DETECT_INTERVAL_MS = 450
 const HOOP_TRIGGER_RADIUS = 0.07
 const SHOT_COOLDOWN_S = 3
+const AUTO_ENROLL_TICKS = 4 // a track must persist ~2s before auto-enrolling
 
 interface ShotProposal {
   id: string
@@ -55,6 +59,9 @@ export default function LiveAiTrackerPage() {
   const lastShotCheckRef = useRef(-Infinity)
   const shotBusyRef = useRef(false)
   const hoopPointRef = useRef<{ x: number; y: number } | null>(null)
+  const trackSeenRef = useRef<Record<number, number>>({})
+  const lastTorsoRef = useRef<Record<number, RGB>>({})
+  const autoEnrollRef = useRef(false)
 
   const [source, setSource] = useState<'none' | 'file' | 'camera'>('none')
   const [fileName, setFileName] = useState('')
@@ -66,6 +73,11 @@ export default function LiveAiTrackerPage() {
   const [teamColors, setTeamColors] = useState<[RGB, RGB]>([{ r: 200, g: 80, b: 80 }, { r: 80, g: 120, b: 200 }])
   const [assignments, setAssignments] = useState<Record<number, string>>({})
   const [assignPopover, setAssignPopover] = useState<number | null>(null)
+  const [autoEnroll, setAutoEnroll] = useState(false)
+  const [npName, setNpName] = useState('')
+  const [npNumber, setNpNumber] = useState('')
+  const [npColor, setNpColor] = useState('#f97316')
+  const [npTeam, setNpTeam] = useState('')
   const [readingJerseys, setReadingJerseys] = useState(false)
   const [jerseyError, setJerseyError] = useState<string | null>(null)
   const [jerseyResult, setJerseyResult] = useState<string | null>(null)
@@ -81,7 +93,12 @@ export default function LiveAiTrackerPage() {
   const [flash, setFlash] = useState<string | null>(null)
   const [shotChecking, setShotChecking] = useState(false)
   const [shotProposals, setShotProposals] = useState<ShotProposal[]>([])
-  const [pendingManual, setPendingManual] = useState<{ id: string; t: number }[]>([])
+  const [autoStatScan, setAutoStatScan] = useState(false)
+  const autoStatScanRef = useRef(false)
+  const playScanBusyRef = useRef(false)
+  const [scanningPlays, setScanningPlays] = useState(false)
+  const [playProposals, setPlayProposals] = useState<AiEvent[]>([])
+  const [pendingManual, setPendingManual] = useState<{ id: string; t: number; localMake: boolean }[]>([])
 
   const [opponent, setOpponent] = useState('')
   const [gLocation, setGLocation] = useState<'home' | 'away'>('home')
@@ -93,6 +110,12 @@ export default function LiveAiTrackerPage() {
   useEffect(() => {
     hoopPointRef.current = hoopPoint
   }, [hoopPoint])
+  useEffect(() => {
+    autoEnrollRef.current = autoEnroll
+  }, [autoEnroll])
+  useEffect(() => {
+    autoStatScanRef.current = autoStatScan
+  }, [autoStatScan])
 
   const now = useCallback((): number => {
     if (source === 'camera') return (Date.now() - camStartRef.current) / 1000
@@ -198,8 +221,24 @@ export default function LiveAiTrackerPage() {
     [resolvePlayer, pushEvent]
   )
 
+  // Local make/miss read from the ball's path through the marked rim: a
+  // basket is the ball coming from above the rim and dropping below it while
+  // staying in the rim's column. No AI needed for this first guess.
+  const analyzeMake = useCallback((hoop: { x: number; y: number }): boolean => {
+    const hist = ballHistoryRef.current
+    if (hist.length < 3) return false
+    let cameFromAbove = false
+    let droppedThrough = false
+    for (const pt of hist) {
+      const nearX = Math.abs(pt.x - hoop.x) < HOOP_TRIGGER_RADIUS
+      if (nearX && pt.y < hoop.y - 0.01) cameFromAbove = true
+      if (cameFromAbove && nearX && pt.y > hoop.y + 0.02) droppedThrough = true
+    }
+    return droppedThrough
+  }, [])
+
   const handleCandidateShot = useCallback(
-    async (t: number) => {
+    async (t: number, localMake: boolean) => {
       if (shotBusyRef.current) return
       shotBusyRef.current = true
       lastShotCheckRef.current = t
@@ -209,7 +248,7 @@ export default function LiveAiTrackerPage() {
         return
       }
       if (!db.settings.mistralKey) {
-        setPendingManual((prev) => [...prev, { id: uid(), t }])
+        setPendingManual((prev) => [...prev, { id: uid(), t, localMake }])
         shotBusyRef.current = false
         return
       }
@@ -226,7 +265,7 @@ export default function LiveAiTrackerPage() {
           setShotProposals((prev) => [...prev, { id: uid(), t, outcome }])
         }
       } catch {
-        setPendingManual((prev) => [...prev, { id: uid(), t }])
+        setPendingManual((prev) => [...prev, { id: uid(), t, localMake }])
       } finally {
         setShotChecking(false)
         shotBusyRef.current = false
@@ -234,6 +273,42 @@ export default function LiveAiTrackerPage() {
       }
     },
     [db.settings.mistralKey, rosterHint, source]
+  )
+
+  // First jersey number not already used in the roster (no mutation — safe
+  // to call for previews; getDB reflects updateDB writes synchronously).
+  const peekFreeNumber = useCallback(() => {
+    const used = new Set(getDB().roster.map((p) => p.number))
+    let n = 1
+    while (used.has(n)) n++
+    return n
+  }, [])
+
+  // Create a brand-new tracked participant (own number + color, optional
+  // team) and bind it to a detected box — this is how you label a player
+  // who isn't on a roster, exactly like a pickup game.
+  const createParticipant = useCallback(
+    (trackId: number, opts: { name?: string; number: number; color: string; team?: string }) => {
+      const id = uid()
+      const player = {
+        id,
+        name: opts.name?.trim() || `Player ${opts.number}`,
+        number: opts.number,
+        position: '',
+        height: '',
+        weight: '',
+        strideLength: 2.5,
+        notes: '',
+        team: opts.team?.trim() || 'Unrostered',
+        color: opts.color,
+      }
+      updateDB((d) => ({ ...d, roster: [...d.roster, player] }))
+      assignmentsRef.current = { ...assignmentsRef.current, [trackId]: id }
+      setAssignments((prev) => ({ ...prev, [trackId]: id }))
+      setActivePlayer((cur) => cur || id)
+      return id
+    },
+    []
   )
 
   // Detection loop — runs on an interval so the browser controls pacing;
@@ -263,20 +338,43 @@ export default function LiveAiTrackerPage() {
           arr.push({ t, x: cx, y: cy })
         }
 
-        // On-device jersey-color team separation, stable across frames.
+        // On-device jersey-color sampling — used both for team separation
+        // and for coloring auto-enrolled participants by their real jersey.
         const persons = tracked.filter((b) => b.cls === 'person')
-        const colors = persons.map((b) => sampleTorsoColor(video, b)).filter((c): c is RGB => c !== null)
+        const torsoByTrack: Record<number, RGB> = {}
+        for (const b of persons) {
+          const c = sampleTorsoColor(video, b)
+          if (c) {
+            torsoByTrack[b.trackId] = c
+            lastTorsoRef.current[b.trackId] = c
+          }
+        }
+        const colorEntries = persons.filter((b) => torsoByTrack[b.trackId])
+        const colors = colorEntries.map((b) => torsoByTrack[b.trackId])
         if (colors.length > 0) {
           const { assignments: clusterAssign, centroids } = clusterIntoTeams(colors, teamCentroidsRef.current)
           teamCentroidsRef.current = centroids
           setTeamColors(centroids)
           const map: Record<number, number> = {}
-          let ci = 0
-          for (const b of persons) {
-            const c = sampleTorsoColor(video, b)
-            if (c) map[b.trackId] = clusterAssign[ci++]
-          }
+          colorEntries.forEach((b, i) => {
+            map[b.trackId] = clusterAssign[i]
+          })
           setTeamIndexByTrack(map)
+        }
+
+        // Auto-enroll: any person the GPU has tracked steadily for a moment
+        // becomes a numbered, colored participant on its own, and starts
+        // collecting movement data — no manual step.
+        if (autoEnrollRef.current) {
+          for (const b of persons) {
+            if (assignmentsRef.current[b.trackId]) continue
+            const seen = (trackSeenRef.current[b.trackId] = (trackSeenRef.current[b.trackId] ?? 0) + 1)
+            if (seen === AUTO_ENROLL_TICKS) {
+              const torso = lastTorsoRef.current[b.trackId]
+              const color = torso ? rgbToHex(torso) : PARTICIPANT_PALETTE[getDB().roster.length % PARTICIPANT_PALETTE.length]
+              createParticipant(b.trackId, { number: peekFreeNumber(), color })
+            }
+          }
         }
 
         // Ball-near-hoop heuristic — a cheap, on-device trigger for the
@@ -292,7 +390,7 @@ export default function LiveAiTrackerPage() {
           if (hoop && hist.length >= 2 && t - lastShotCheckRef.current > SHOT_COOLDOWN_S) {
             const dist = Math.hypot(cx - hoop.x, cy - hoop.y)
             if (dist < HOOP_TRIGGER_RADIUS) {
-              handleCandidateShot(t)
+              handleCandidateShot(t, analyzeMake(hoop))
             }
           }
         }
@@ -303,7 +401,7 @@ export default function LiveAiTrackerPage() {
       }
     }, DETECT_INTERVAL_MS)
     return () => clearInterval(id)
-  }, [tracking, now, handleCandidateShot])
+  }, [tracking, now, handleCandidateShot, analyzeMake, createParticipant, peekFreeNumber])
 
   const addTag = useCallback(
     (type: string) => {
@@ -359,10 +457,22 @@ export default function LiveAiTrackerPage() {
   }
 
   function assignTrack(trackId: number, playerId: string) {
+    assignmentsRef.current = { ...assignmentsRef.current, [trackId]: playerId }
     setAssignments((prev) => ({ ...prev, [trackId]: playerId }))
     setActivePlayer((cur) => cur || playerId)
     setAssignPopover(null)
   }
+
+  // Prefill the new-participant form when a box popover opens: suggest the
+  // next free number and the box's own detected jersey color.
+  useEffect(() => {
+    if (assignPopover == null) return
+    setNpName('')
+    setNpNumber(String(peekFreeNumber()))
+    const torso = lastTorsoRef.current[assignPopover]
+    setNpColor(torso ? rgbToHex(torso) : PARTICIPANT_PALETTE[getDB().roster.length % PARTICIPANT_PALETTE.length])
+    setNpTeam('')
+  }, [assignPopover, peekFreeNumber])
   function unassignTrack(trackId: number) {
     setAssignments((prev) => {
       const next = { ...prev }
@@ -416,6 +526,54 @@ export default function LiveAiTrackerPage() {
     } finally {
       setReadingJerseys(false)
     }
+  }
+
+  // Full-scene play scan: samples a short window and asks the vision model
+  // to enumerate every event for every visible player — shots, passes,
+  // blocks, screen assists, assists, deflections, hustle plays — regardless
+  // of how many people are on screen. Runs on a timer while enabled, and can
+  // be fired once on demand.
+  const runPlayScan = useCallback(async () => {
+    if (playScanBusyRef.current) return
+    const video = videoRef.current
+    if (!video || !db.settings.mistralKey || video.readyState < 2) return
+    playScanBusyRef.current = true
+    setScanningPlays(true)
+    const wasRunning = runningRef.current
+    if (source === 'file') runningRef.current = false
+    try {
+      const base = now()
+      const frames =
+        source === 'file'
+          ? await extractFramesAt(video, [Math.max(0, base - 4), Math.max(0, base - 3), Math.max(0, base - 2), Math.max(0, base - 1), base])
+          : await captureBurst(video, 5, 500)
+      const found = await analyzeFrames(db.settings.mistralKey, frames, rosterHint)
+      if (found.length) setPlayProposals((prev) => [...prev, ...found].slice(-60))
+    } catch {
+      // transient failure (rate limit / seek) — the next scan will retry
+    } finally {
+      setScanningPlays(false)
+      playScanBusyRef.current = false
+      if (source === 'file') runningRef.current = wasRunning
+    }
+  }, [db.settings.mistralKey, rosterHint, source, now])
+
+  useEffect(() => {
+    if (!tracking || !autoStatScan) return
+    const id = setInterval(() => {
+      if (autoStatScanRef.current) runPlayScan()
+    }, 9000)
+    return () => clearInterval(id)
+  }, [tracking, autoStatScan, runPlayScan])
+
+  function acceptPlay(p: AiEvent) {
+    const byJersey = p.jersey != null ? db.roster.find((r) => r.number === p.jersey) : undefined
+    const pid = byJersey?.id ?? activePlayer
+    if (pid) pushEvent(pid, p.type, p.t)
+    setPlayProposals((prev) => prev.filter((x) => x !== p))
+  }
+  function dismissPlay(p: AiEvent) {
+    setPlayProposals((prev) => prev.filter((x) => x !== p))
   }
 
   function acceptShotProposal(sp: ShotProposal) {
@@ -505,15 +663,17 @@ export default function LiveAiTrackerPage() {
     <div className="p-4 md:p-8 max-w-[1500px]">
       <h1 className="text-2xl font-bold text-foreground mb-1">Live AI Tracker</h1>
       <p className="text-sm text-muted-foreground mb-1">
-        On-device AI (runs on your GPU via WebGL, nothing uploaded) detects people and the ball live,
-        separates the two teams by actual jersey color, and — once you mark the hoop — flags shot
-        attempts near the rim for AI confirmation of make/miss, assists and blocks.
+        On-device AI (runs on your GPU via WebGL, nothing uploaded) detects every person and the ball
+        live, separates teams by actual jersey color, and collects movement (distance, speed, strides)
+        for everyone on screen. Turn on <b>Auto-enroll</b> and it numbers and starts tracking each
+        player by itself; turn on <b>Auto stat scan</b> and it reads shots, passes, blocks, screens,
+        assists, deflections and hustle plays for all players continuously.
       </p>
       <p className="text-xs text-muted-foreground mb-6">
-        Bounding-box detection alone can&apos;t tell make from miss or who passed — that&apos;s why marking
-        the hoop only <b>flags candidates</b>; a quick AI vision check (needs your free Mistral key)
-        confirms the outcome, and you approve each one before it&apos;s added to the box score. Team colors
-        are the actual averaged jersey pixels, clustered into two groups — not assumed.
+        Give any box its own number and color (great for pickup games with no roster). Mark the rim
+        once and a ball dropping through it counts a make automatically; the AI vision check confirms
+        make/miss, shooter, assist and block. Everything lands in a review queue you approve — nothing
+        is silently miscounted. AI features use your free Mistral key from Settings.
       </p>
 
       <div className="grid gap-5 lg:grid-cols-[minmax(0,2fr)_minmax(320px,1fr)]">
@@ -577,8 +737,10 @@ export default function LiveAiTrackerPage() {
                 const playerId = assignments[b.trackId]
                 const player = playerId ? db.roster.find((p) => p.id === playerId) : null
                 const teamIdx = teamIndexByTrack[b.trackId] ?? 0
-                const color = isBall ? '#f97316' : rgbToCss(teamColors[teamIdx])
-                const label = isBall ? 'BALL' : player ? `✓ #${player.number} ${player.name.split(' ').slice(-1)[0]}` : `Team ${teamIdx === 0 ? 'A' : 'B'} · ${b.trackId}`
+                // Ball is always orange; a named participant uses its own
+                // assigned color; anyone else falls back to their team color.
+                const color = isBall ? '#f97316' : player?.color || rgbToCss(teamColors[teamIdx])
+                const label = isBall ? 'BALL' : player ? `${player.name.split(' ').slice(-1)[0]}` : `Team ${teamIdx === 0 ? 'A' : 'B'} · ${b.trackId}`
                 return (
                   <g
                     key={`${b.cls}-${b.trackId}`}
@@ -590,8 +752,23 @@ export default function LiveAiTrackerPage() {
                     }}
                   >
                     <rect x={b.x * 100} y={b.y * 100} width={b.w * 100} height={b.h * 100} fill="none" stroke={color} strokeWidth="0.5" vectorEffect="non-scaling-stroke" />
-                    <rect x={b.x * 100} y={Math.max(0, b.y * 100 - 4.2)} width={Math.min(96, label.length * 1.7 + 2)} height="4" fill={color} />
+                    <rect x={b.x * 100} y={Math.max(0, b.y * 100 - 4.2)} width={Math.min(96, label.length * 1.7 + 3)} height="4" fill={color} />
                     <text x={b.x * 100 + 0.8} y={Math.max(0, b.y * 100 - 4.2) + 3} fontSize="3" fontWeight="700" fill="#000">{label}</text>
+                    {player && (
+                      <text
+                        x={(b.x + b.w / 2) * 100}
+                        y={(b.y + b.h * 0.42) * 100}
+                        textAnchor="middle"
+                        fontSize="6"
+                        fontWeight="800"
+                        fill={color}
+                        stroke="#000"
+                        strokeWidth="0.2"
+                        style={{ paintOrder: 'stroke' }}
+                      >
+                        {player.number}
+                      </text>
+                    )}
                   </g>
                 )
               })}
@@ -636,6 +813,36 @@ export default function LiveAiTrackerPage() {
             </span>
           </div>
 
+          {/* Autonomous data-collection toggles */}
+          <div className="flex flex-wrap items-center gap-2 mt-3">
+            <button
+              type="button"
+              onClick={() => setAutoEnroll((v) => !v)}
+              className={`px-3.5 py-2 text-sm font-medium rounded-lg border ${autoEnroll ? 'border-green-500 bg-green-500/10 text-green-500' : 'border-border text-muted-foreground hover:text-foreground'}`}
+            >
+              {autoEnroll ? '● Auto-enroll ON' : 'Auto-enroll players'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setAutoStatScan((v) => !v)}
+              disabled={!db.settings.mistralKey}
+              className={`px-3.5 py-2 text-sm font-medium rounded-lg border disabled:opacity-40 ${autoStatScan ? 'border-green-500 bg-green-500/10 text-green-500' : 'border-border text-muted-foreground hover:text-foreground'}`}
+            >
+              {autoStatScan ? '● Auto stat scan ON' : 'Auto stat scan (AI)'}
+            </button>
+            <button
+              type="button"
+              onClick={runPlayScan}
+              disabled={scanningPlays || !db.settings.mistralKey || !tracking}
+              className="px-3.5 py-2 text-sm font-medium rounded-lg border border-border text-foreground hover:border-orange-500 hover:text-orange-500 disabled:opacity-40"
+            >
+              {scanningPlays ? 'Scanning plays…' : '⚡ Scan plays now'}
+            </button>
+            <span className="text-xs text-muted-foreground">
+              Auto-enroll numbers & tracks everyone on its own; Auto stat scan reads shots, passes, blocks, screens, assists, deflections & hustle every few seconds.
+            </span>
+          </div>
+
           <div className="flex flex-wrap items-center gap-2 mt-3">
             <button
               type="button"
@@ -655,21 +862,65 @@ export default function LiveAiTrackerPage() {
           {assignPopover != null && (
             <div className="mt-3 bg-card border border-orange-500 rounded-xl p-3">
               <div className="flex items-center justify-between mb-2">
-                <p className="text-sm font-semibold text-foreground">Assign track #{assignPopover}</p>
+                <p className="text-sm font-semibold text-foreground">Label this box (track #{assignPopover})</p>
                 <button type="button" onClick={() => setAssignPopover(null)} className="text-xs text-muted-foreground hover:text-foreground">✕</button>
               </div>
-              <div className="flex flex-wrap gap-1.5">
-                {db.roster.map((p) => (
-                  <button key={p.id} type="button" onClick={() => assignTrack(assignPopover, p.id)}
-                    className="px-2.5 py-1.5 text-xs font-medium rounded-lg border border-border text-foreground hover:border-green-500 hover:text-green-500">
-                    #{p.number} {p.name}
-                  </button>
-                ))}
-                {assignmentsRef.current[assignPopover] && (
-                  <button type="button" onClick={() => unassignTrack(assignPopover)} className="px-2.5 py-1.5 text-xs font-medium rounded-lg border border-red-500 text-red-500">
-                    Unassign
-                  </button>
-                )}
+
+              {db.roster.length > 0 && (
+                <>
+                  <p className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1.5">Assign an existing player</p>
+                  <div className="flex flex-wrap gap-1.5 mb-3">
+                    {db.roster.map((p) => (
+                      <button key={p.id} type="button" onClick={() => assignTrack(assignPopover, p.id)}
+                        className="px-2.5 py-1.5 text-xs font-medium rounded-lg border border-border text-foreground hover:border-green-500 hover:text-green-500 flex items-center gap-1.5">
+                        {p.color && <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ background: p.color }} />}
+                        #{p.number} {p.name}
+                      </button>
+                    ))}
+                    {assignmentsRef.current[assignPopover] && (
+                      <button type="button" onClick={() => unassignTrack(assignPopover)} className="px-2.5 py-1.5 text-xs font-medium rounded-lg border border-red-500 text-red-500">
+                        Unassign
+                      </button>
+                    )}
+                  </div>
+                </>
+              )}
+
+              <p className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1.5">Or create a new participant (number + color)</p>
+              <div className="flex flex-wrap items-end gap-2">
+                <div>
+                  <label className="block text-[10px] text-muted-foreground mb-0.5">Name (optional)</label>
+                  <input value={npName} onChange={(e) => setNpName(e.target.value)} placeholder="e.g. Wemby"
+                    className="w-28 px-2 py-1.5 text-xs rounded border border-border bg-background text-foreground" />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-muted-foreground mb-0.5">Number</label>
+                  <input value={npNumber} onChange={(e) => setNpNumber(e.target.value)} type="number" min="0" max="99"
+                    className="w-16 px-2 py-1.5 text-xs rounded border border-border bg-background text-foreground" />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-muted-foreground mb-0.5">Color</label>
+                  <input value={npColor} onChange={(e) => setNpColor(e.target.value)} type="color"
+                    className="w-10 h-8 rounded border border-border bg-background" />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-muted-foreground mb-0.5">Team (optional)</label>
+                  <input value={npTeam} onChange={(e) => setNpTeam(e.target.value)} placeholder="Unrostered"
+                    className="w-28 px-2 py-1.5 text-xs rounded border border-border bg-background text-foreground" />
+                </div>
+                <button type="button"
+                  onClick={() => {
+                    createParticipant(assignPopover, {
+                      name: npName,
+                      number: Number(npNumber) || peekFreeNumber(),
+                      color: npColor,
+                      team: npTeam,
+                    })
+                    setAssignPopover(null)
+                  }}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-green-600 text-white hover:bg-green-500">
+                  Create &amp; assign
+                </button>
               </div>
             </div>
           )}
@@ -707,20 +958,71 @@ export default function LiveAiTrackerPage() {
             </div>
           )}
 
-          {/* Manual review queue — used when no Mistral key is set */}
+          {/* Rim make/miss queue — local ball-through-rim guess, one-click to
+              the active player. AI confirmation fills in shooter/assist when a
+              Mistral key is set; this path is the no-key fast lane. */}
           {pendingManual.length > 0 && (
             <div className="mt-4 border border-border rounded-xl overflow-hidden">
               <div className="px-3 py-2 bg-muted/30 border-b border-border">
-                <p className="text-xs font-semibold text-foreground">Ball crossed the hoop zone {pendingManual.length}× — add a Mistral key in Settings to auto-confirm, or tag manually below</p>
+                <p className="text-xs font-semibold text-foreground">
+                  {pendingManual.length} ball-at-rim moment(s) — the guess is from the ball&apos;s path through the rim; confirm for the active player
+                </p>
               </div>
               <div className="divide-y divide-border">
-                {pendingManual.map((m) => (
-                  <div key={m.id} className="flex items-center gap-2 px-3 py-2 text-xs">
-                    <span className="tabular-nums text-muted-foreground w-12">{fmtClock(m.t)}</span>
-                    <span className="text-muted-foreground flex-1">Possible shot — use the tag pad to record it for the active player.</span>
-                    <button type="button" onClick={() => dismissManual(m.id)} className="text-red-500 hover:underline">dismiss</button>
-                  </div>
-                ))}
+                {pendingManual.map((m) => {
+                  const active = db.roster.find((p) => p.id === activePlayer)
+                  return (
+                    <div key={m.id} className="flex flex-wrap items-center gap-2 px-3 py-2 text-xs">
+                      <span className="tabular-nums text-muted-foreground w-12 shrink-0">{fmtClock(m.t)}</span>
+                      <span className={`px-1.5 py-0.5 rounded font-semibold shrink-0 ${m.localMake ? 'bg-green-500/10 text-green-500' : 'bg-red-500/10 text-red-500'}`}>
+                        {m.localMake ? 'likely MADE' : 'likely MISS'}
+                      </span>
+                      <span className="text-muted-foreground truncate flex-1">
+                        {active ? `for #${active.number} ${active.name}` : 'pick an active player first'}
+                      </span>
+                      <button type="button" disabled={!activePlayer}
+                        onClick={() => { pushEvent(activePlayer, 'fg2m', m.t); dismissManual(m.id) }}
+                        className="shrink-0 px-2 py-1 rounded bg-green-600 text-white font-semibold hover:bg-green-500 disabled:opacity-40">Made 2</button>
+                      <button type="button" disabled={!activePlayer}
+                        onClick={() => { pushEvent(activePlayer, 'fg3m', m.t); dismissManual(m.id) }}
+                        className="shrink-0 px-2 py-1 rounded bg-green-700 text-white font-semibold hover:bg-green-600 disabled:opacity-40">Made 3</button>
+                      <button type="button" disabled={!activePlayer}
+                        onClick={() => { pushEvent(activePlayer, 'fg2x', m.t); dismissManual(m.id) }}
+                        className="shrink-0 px-2 py-1 rounded bg-red-600 text-white font-semibold hover:bg-red-500 disabled:opacity-40">Miss</button>
+                      <button type="button" onClick={() => dismissManual(m.id)} className="shrink-0 text-red-500 hover:underline">dismiss</button>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Full-scene play proposals (all players, all play types) */}
+          {playProposals.length > 0 && (
+            <div className="mt-4 border border-blue-500 rounded-xl overflow-hidden">
+              <div className="flex items-center justify-between px-3 py-2 bg-blue-500/10 border-b border-blue-500">
+                <p className="text-xs font-semibold text-blue-600 dark:text-blue-400">{playProposals.length} AI-detected play(s) across all players — review and accept</p>
+                <div className="flex gap-2">
+                  <button type="button" onClick={() => [...playProposals].forEach(acceptPlay)} className="text-xs text-green-500 hover:underline">Accept all</button>
+                  <button type="button" onClick={() => setPlayProposals([])} className="text-xs text-red-500 hover:underline">Dismiss all</button>
+                </div>
+              </div>
+              <div className="max-h-56 overflow-y-auto bg-card">
+                {[...playProposals].reverse().map((p, i) => {
+                  const byJersey = p.jersey != null ? db.roster.find((r) => r.number === p.jersey) : undefined
+                  return (
+                    <div key={i} className="flex items-center gap-2 px-3 py-2 text-xs border-b border-border last:border-0">
+                      <span className="tabular-nums text-muted-foreground w-12 shrink-0">{fmtClock(p.t)}</span>
+                      <span className="px-1.5 py-0.5 rounded bg-orange-500/10 text-orange-500 font-medium shrink-0">{tagByType[p.type]?.label ?? p.type}</span>
+                      <span className="text-foreground truncate flex-1">
+                        {byJersey ? `#${byJersey.number} ${byJersey.name}` : p.jersey != null ? `#${p.jersey} (not on roster)` : p.description || 'unassigned'}
+                      </span>
+                      <span className={`shrink-0 ${p.confidence === 'high' ? 'text-green-500' : p.confidence === 'low' ? 'text-red-400' : 'text-yellow-500'}`}>{p.confidence}</span>
+                      <button type="button" onClick={() => acceptPlay(p)} className="shrink-0 px-2 py-1 rounded bg-green-600 text-white font-semibold hover:bg-green-500">Accept</button>
+                      <button type="button" onClick={() => dismissPlay(p)} className="shrink-0 text-red-500 hover:underline">✕</button>
+                    </div>
+                  )
+                })}
               </div>
             </div>
           )}

@@ -17,6 +17,7 @@ export interface RosterPlayer {
   strideLength: number // meters, used to estimate strides from distance
   notes: string
   team: string // "My Team" by default; scouted/opponent players can use any name
+  color?: string // optional custom box/jersey color (hex); falls back to auto team color
 }
 
 export interface ShotMark {
