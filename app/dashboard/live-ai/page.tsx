@@ -15,11 +15,28 @@ import {
   type SessionEvent,
   type PlayerMovement,
 } from '@/lib/basketball/store'
-import { loadDetector, detectFrame, CentroidTracker, type DetectedBox } from '@/lib/basketball/detector'
-import { readJerseyNumbers } from '@/lib/basketball/ai'
+import {
+  loadDetector,
+  detectFrame,
+  CentroidTracker,
+  sampleTorsoColor,
+  clusterIntoTeams,
+  rgbToCss,
+  type DetectedBox,
+  type RGB,
+} from '@/lib/basketball/detector'
+import { readJerseyNumbers, confirmShotOutcome, captureBurst, extractFramesAt, type ShotOutcome } from '@/lib/basketball/ai'
 
 const fmtClock = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
 const DETECT_INTERVAL_MS = 450
+const HOOP_TRIGGER_RADIUS = 0.07
+const SHOT_COOLDOWN_S = 3
+
+interface ShotProposal {
+  id: string
+  t: number
+  outcome: ShotOutcome
+}
 
 export default function LiveAiTrackerPage() {
   const db = useDB()
@@ -33,6 +50,11 @@ export default function LiveAiTrackerPage() {
   const busyRef = useRef(false)
   const assignmentsRef = useRef<Record<number, string>>({})
   const movementRef = useRef<Record<string, { t: number; x: number; y: number }[]>>({})
+  const teamCentroidsRef = useRef<[RGB, RGB] | undefined>(undefined)
+  const ballHistoryRef = useRef<{ t: number; x: number; y: number }[]>([])
+  const lastShotCheckRef = useRef(-Infinity)
+  const shotBusyRef = useRef(false)
+  const hoopPointRef = useRef<{ x: number; y: number } | null>(null)
 
   const [source, setSource] = useState<'none' | 'file' | 'camera'>('none')
   const [fileName, setFileName] = useState('')
@@ -40,20 +62,26 @@ export default function LiveAiTrackerPage() {
   const [modelState, setModelState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
   const [tracking, setTracking] = useState(false)
   const [boxes, setBoxes] = useState<DetectedBox[]>([])
+  const [teamIndexByTrack, setTeamIndexByTrack] = useState<Record<number, number>>({})
+  const [teamColors, setTeamColors] = useState<[RGB, RGB]>([{ r: 200, g: 80, b: 80 }, { r: 80, g: 120, b: 200 }])
   const [assignments, setAssignments] = useState<Record<number, string>>({})
   const [assignPopover, setAssignPopover] = useState<number | null>(null)
   const [readingJerseys, setReadingJerseys] = useState(false)
   const [jerseyError, setJerseyError] = useState<string | null>(null)
   const [jerseyResult, setJerseyResult] = useState<string | null>(null)
-  const [mode, setMode] = useState<'assign' | 'calibrate'>('assign')
+  const [mode, setMode] = useState<'assign' | 'calibrate' | 'hoop'>('assign')
   const [calPoints, setCalPoints] = useState<{ x: number; y: number }[]>([])
   const [calMeters, setCalMeters] = useState(28)
   const [metersPerUnit, setMetersPerUnit] = useState<number | null>(null)
+  const [hoopPoint, setHoopPoint] = useState<{ x: number; y: number } | null>(null)
   const [, setTick] = useState(0)
   const [clock, setClock] = useState(0)
   const [activePlayer, setActivePlayer] = useState('')
   const [events, setEvents] = useState<SessionEvent[]>([])
   const [flash, setFlash] = useState<string | null>(null)
+  const [shotChecking, setShotChecking] = useState(false)
+  const [shotProposals, setShotProposals] = useState<ShotProposal[]>([])
+  const [pendingManual, setPendingManual] = useState<{ id: string; t: number }[]>([])
 
   const [opponent, setOpponent] = useState('')
   const [gLocation, setGLocation] = useState<'home' | 'away'>('home')
@@ -62,6 +90,9 @@ export default function LiveAiTrackerPage() {
   useEffect(() => {
     assignmentsRef.current = assignments
   }, [assignments])
+  useEffect(() => {
+    hoopPointRef.current = hoopPoint
+  }, [hoopPoint])
 
   const now = useCallback((): number => {
     if (source === 'camera') return (Date.now() - camStartRef.current) / 1000
@@ -78,6 +109,7 @@ export default function LiveAiTrackerPage() {
     setSource('file')
     setFileName(file.name)
     trackerRef.current.reset()
+    ballHistoryRef.current = []
     const v = videoRef.current
     if (v) {
       v.srcObject = null
@@ -98,6 +130,7 @@ export default function LiveAiTrackerPage() {
       }
       camStartRef.current = Date.now()
       trackerRef.current.reset()
+      ballHistoryRef.current = []
       setSource('camera')
       setFileName('Live camera')
     } catch {
@@ -134,6 +167,75 @@ export default function LiveAiTrackerPage() {
     setTracking(true)
   }
 
+  const rosterHint = db.roster.map((p) => `#${p.number} ${p.name}`).join(', ')
+
+  const resolvePlayer = useCallback(
+    (jersey: number | null) => (jersey == null ? null : db.roster.find((p) => p.number === jersey) ?? null),
+    [db.roster]
+  )
+
+  const pushEvent = useCallback((playerId: string, type: string, t: number) => {
+    setEvents((prev) => [...prev, { id: uid(), t, playerId, type }].sort((a, b) => a.t - b.t))
+  }, [])
+
+  const applyShotOutcome = useCallback(
+    (t: number, outcome: ShotOutcome) => {
+      const shotTypeCode = outcome.shotType === '3PT' ? (outcome.made ? 'fg3m' : 'fg3x')
+        : outcome.shotType === 'FT' ? (outcome.made ? 'ftm' : 'ftx')
+        : (outcome.made ? 'fg2m' : 'fg2x')
+      const shooter = resolvePlayer(outcome.shooterJersey)
+      if (shooter) pushEvent(shooter.id, shotTypeCode, t)
+      if (outcome.made) {
+        const assister = resolvePlayer(outcome.assistJersey)
+        if (assister) pushEvent(assister.id, 'ast', t - 0.1)
+        const hockeyAssister = resolvePlayer(outcome.hockeyAssistJersey)
+        if (hockeyAssister) pushEvent(hockeyAssister.id, 'hast', t - 0.2)
+      } else {
+        const blocker = resolvePlayer(outcome.blockedByJersey)
+        if (blocker) pushEvent(blocker.id, 'blk', t)
+      }
+    },
+    [resolvePlayer, pushEvent]
+  )
+
+  const handleCandidateShot = useCallback(
+    async (t: number) => {
+      if (shotBusyRef.current) return
+      shotBusyRef.current = true
+      lastShotCheckRef.current = t
+      const video = videoRef.current
+      if (!video) {
+        shotBusyRef.current = false
+        return
+      }
+      if (!db.settings.mistralKey) {
+        setPendingManual((prev) => [...prev, { id: uid(), t }])
+        shotBusyRef.current = false
+        return
+      }
+      setShotChecking(true)
+      const wasTracking = runningRef.current
+      if (source === 'file') runningRef.current = false // pause the detect loop while we seek around
+      try {
+        const frames =
+          source === 'file'
+            ? await extractFramesAt(video, [Math.max(0, t - 0.6), Math.max(0, t - 0.3), t, t + 0.3])
+            : await captureBurst(video, 3, 280)
+        const outcome = await confirmShotOutcome(db.settings.mistralKey, frames, rosterHint)
+        if (outcome.attempted) {
+          setShotProposals((prev) => [...prev, { id: uid(), t, outcome }])
+        }
+      } catch {
+        setPendingManual((prev) => [...prev, { id: uid(), t }])
+      } finally {
+        setShotChecking(false)
+        shotBusyRef.current = false
+        if (source === 'file') runningRef.current = wasTracking
+      }
+    },
+    [db.settings.mistralKey, rosterHint, source]
+  )
+
   // Detection loop — runs on an interval so the browser controls pacing;
   // guarded so a slow detection pass never overlaps the next tick.
   useEffect(() => {
@@ -149,6 +251,8 @@ export default function LiveAiTrackerPage() {
         const tracked = trackerRef.current.update(dets)
         setBoxes(tracked)
         const t = now()
+
+        // Movement accrual for assigned players.
         for (const b of tracked) {
           if (b.cls !== 'person') continue
           const playerId = assignmentsRef.current[b.trackId]
@@ -158,25 +262,59 @@ export default function LiveAiTrackerPage() {
           const arr = movementRef.current[playerId] ?? (movementRef.current[playerId] = [])
           arr.push({ t, x: cx, y: cy })
         }
+
+        // On-device jersey-color team separation, stable across frames.
+        const persons = tracked.filter((b) => b.cls === 'person')
+        const colors = persons.map((b) => sampleTorsoColor(video, b)).filter((c): c is RGB => c !== null)
+        if (colors.length > 0) {
+          const { assignments: clusterAssign, centroids } = clusterIntoTeams(colors, teamCentroidsRef.current)
+          teamCentroidsRef.current = centroids
+          setTeamColors(centroids)
+          const map: Record<number, number> = {}
+          let ci = 0
+          for (const b of persons) {
+            const c = sampleTorsoColor(video, b)
+            if (c) map[b.trackId] = clusterAssign[ci++]
+          }
+          setTeamIndexByTrack(map)
+        }
+
+        // Ball-near-hoop heuristic — a cheap, on-device trigger for the
+        // (rate-limited) AI confirmation step, not a made/miss call itself.
+        const ball = tracked.find((b) => b.cls === 'sports ball')
+        if (ball) {
+          const cx = ball.x + ball.w / 2
+          const cy = ball.y + ball.h / 2
+          const hist = ballHistoryRef.current
+          hist.push({ t, x: cx, y: cy })
+          if (hist.length > 10) hist.shift()
+          const hoop = hoopPointRef.current
+          if (hoop && hist.length >= 2 && t - lastShotCheckRef.current > SHOT_COOLDOWN_S) {
+            const dist = Math.hypot(cx - hoop.x, cy - hoop.y)
+            if (dist < HOOP_TRIGGER_RADIUS) {
+              handleCandidateShot(t)
+            }
+          }
+        }
+
         setTick((c) => c + 1)
       } finally {
         busyRef.current = false
       }
     }, DETECT_INTERVAL_MS)
     return () => clearInterval(id)
-  }, [tracking, now])
+  }, [tracking, now, handleCandidateShot])
 
   const addTag = useCallback(
     (type: string) => {
       if (!activePlayer) return
-      const ev: SessionEvent = { id: uid(), t: now(), playerId: activePlayer, type }
-      setEvents((prev) => [...prev, ev])
+      pushEvent(activePlayer, type, now())
       const tag = tagByType[type]
       const p = db.roster.find((r) => r.id === activePlayer)
       setFlash(`${tag?.label} — ${p?.name.split(' ').slice(-1)[0] ?? ''}`)
       setTimeout(() => setFlash(null), 900)
     },
-    [activePlayer, now, db.roster]
+    [activePlayer, now, db.roster, pushEvent]
   )
 
   useEffect(() => {
@@ -200,20 +338,24 @@ export default function LiveAiTrackerPage() {
   }, [addTag])
 
   function onOverlayClick(e: React.MouseEvent) {
-    if (mode !== 'calibrate' || !boxRef.current) return
+    if (!boxRef.current) return
     const rect = boxRef.current.getBoundingClientRect()
     const x = (e.clientX - rect.left) / rect.width
     const y = (e.clientY - rect.top) / rect.height
-    setCalPoints((prev) => {
-      const next = [...prev, { x, y }].slice(-2)
-      if (next.length === 2) {
-        const dx = (next[0].x - next[1].x) * rect.width
-        const dy = (next[0].y - next[1].y) * rect.height
-        const px = Math.sqrt(dx * dx + dy * dy)
-        if (px > 4) setMetersPerUnit(calMeters / px)
-      }
-      return next
-    })
+    if (mode === 'calibrate') {
+      setCalPoints((prev) => {
+        const next = [...prev, { x, y }].slice(-2)
+        if (next.length === 2) {
+          const dx = (next[0].x - next[1].x) * rect.width
+          const dy = (next[0].y - next[1].y) * rect.height
+          const px = Math.sqrt(dx * dx + dy * dy)
+          if (px > 4) setMetersPerUnit(calMeters / px)
+        }
+        return next
+      })
+    } else if (mode === 'hoop') {
+      setHoopPoint({ x, y })
+    }
   }
 
   function assignTrack(trackId: number, playerId: string) {
@@ -274,6 +416,17 @@ export default function LiveAiTrackerPage() {
     } finally {
       setReadingJerseys(false)
     }
+  }
+
+  function acceptShotProposal(sp: ShotProposal) {
+    applyShotOutcome(sp.t, sp.outcome)
+    setShotProposals((prev) => prev.filter((x) => x.id !== sp.id))
+  }
+  function dismissShotProposal(id: string) {
+    setShotProposals((prev) => prev.filter((x) => x.id !== id))
+  }
+  function dismissManual(id: string) {
+    setPendingManual((prev) => prev.filter((x) => x.id !== id))
   }
 
   // Movement summary, recomputed whenever a detection tick lands.
@@ -352,15 +505,15 @@ export default function LiveAiTrackerPage() {
     <div className="p-4 md:p-8 max-w-[1500px]">
       <h1 className="text-2xl font-bold text-foreground mb-1">Live AI Tracker</h1>
       <p className="text-sm text-muted-foreground mb-1">
-        On-device AI (runs on your GPU via WebGL, nothing uploaded) detects people and the ball live
-        from your camera or an uploaded video, and follows each box across frames.
+        On-device AI (runs on your GPU via WebGL, nothing uploaded) detects people and the ball live,
+        separates the two teams by actual jersey color, and — once you mark the hoop — flags shot
+        attempts near the rim for AI confirmation of make/miss, assists and blocks.
       </p>
       <p className="text-xs text-muted-foreground mb-6">
-        The detector itself only knows <b>where</b> people and the ball are, not who they are — use
-        &quot;Read jersey numbers (AI)&quot; to have Mistral&apos;s vision model read visible numbers and
-        auto-assign matching roster players, or assign a box yourself by clicking it. Either way the
-        tracker then keeps following that box; if two players cross paths and a label jumps to the
-        wrong one, just reassign it.
+        Bounding-box detection alone can&apos;t tell make from miss or who passed — that&apos;s why marking
+        the hoop only <b>flags candidates</b>; a quick AI vision check (needs your free Mistral key)
+        confirms the outcome, and you approve each one before it&apos;s added to the box score. Team colors
+        are the actual averaged jersey pixels, clustered into two groups — not assumed.
       </p>
 
       <div className="grid gap-5 lg:grid-cols-[minmax(0,2fr)_minmax(320px,1fr)]">
@@ -386,6 +539,11 @@ export default function LiveAiTrackerPage() {
             {source !== 'none' && (
               <span className="self-center text-xs text-muted-foreground truncate max-w-[200px]">{fileName} · {fmtClock(clock)}</span>
             )}
+            {shotChecking && (
+              <span className="self-center text-xs font-medium text-orange-500 flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-orange-500 animate-pulse" /> Checking possible shot…
+              </span>
+            )}
           </div>
           {camError && <p className="text-sm text-red-500 mb-3">{camError}</p>}
           {modelState === 'error' && <p className="text-sm text-red-500 mb-3">Could not load the AI model — check your connection and retry.</p>}
@@ -393,7 +551,7 @@ export default function LiveAiTrackerPage() {
           <div
             ref={boxRef}
             onClick={onOverlayClick}
-            className={`relative bg-black rounded-xl overflow-hidden border border-border ${mode === 'calibrate' ? 'cursor-crosshair' : ''}`}
+            className={`relative bg-black rounded-xl overflow-hidden border border-border ${mode !== 'assign' ? 'cursor-crosshair' : ''}`}
             style={{ aspectRatio: '16 / 9' }}
           >
             <video ref={videoRef} playsInline controls={source === 'file'} className="w-full h-full object-contain" />
@@ -408,12 +566,19 @@ export default function LiveAiTrackerPage() {
                 <line x1={calPoints[0].x * 100} y1={calPoints[0].y * 100} x2={calPoints[1].x * 100} y2={calPoints[1].y * 100} stroke="#facc15" strokeWidth="0.4" strokeDasharray="1.5 1" />
               )}
               {calPoints.map((p, i) => <circle key={i} cx={p.x * 100} cy={p.y * 100} r="0.9" fill="#facc15" />)}
+              {hoopPoint && (
+                <g>
+                  <circle cx={hoopPoint.x * 100} cy={hoopPoint.y * 100} r={HOOP_TRIGGER_RADIUS * 100} fill="none" stroke="#f97316" strokeWidth="0.3" strokeDasharray="1 1" />
+                  <circle cx={hoopPoint.x * 100} cy={hoopPoint.y * 100} r="0.8" fill="#f97316" />
+                </g>
+              )}
               {boxes.map((b) => {
                 const isBall = b.cls === 'sports ball'
                 const playerId = assignments[b.trackId]
                 const player = playerId ? db.roster.find((p) => p.id === playerId) : null
-                const label = isBall ? 'BALL' : player ? `#${player.number} ${player.name.split(' ').slice(-1)[0]}` : `track ${b.trackId}`
-                const color = isBall ? '#f97316' : player ? '#22c55e' : '#94a3b8'
+                const teamIdx = teamIndexByTrack[b.trackId] ?? 0
+                const color = isBall ? '#f97316' : rgbToCss(teamColors[teamIdx])
+                const label = isBall ? 'BALL' : player ? `✓ #${player.number} ${player.name.split(' ').slice(-1)[0]}` : `Team ${teamIdx === 0 ? 'A' : 'B'} · ${b.trackId}`
                 return (
                   <g
                     key={`${b.cls}-${b.trackId}`}
@@ -437,13 +602,13 @@ export default function LiveAiTrackerPage() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2 mt-3">
-            {([['assign', 'Assign mode'], ['calibrate', 'Calibrate court']] as const).map(([m, label]) => (
+            {([['assign', 'Assign mode'], ['calibrate', 'Calibrate court'], ['hoop', 'Mark hoop']] as const).map(([m, label]) => (
               <button key={m} type="button" onClick={() => setMode(m)}
                 className={`px-3.5 py-2 text-sm font-medium rounded-lg border ${mode === m ? 'border-orange-500 bg-orange-500/10 text-orange-500' : 'border-border text-muted-foreground hover:text-foreground'}`}>
                 {label}
               </button>
             ))}
-            {mode === 'assign' && <span className="text-xs text-muted-foreground">Click a gray box to name it.</span>}
+            {mode === 'assign' && <span className="text-xs text-muted-foreground">Click a box to name it.</span>}
             {mode === 'calibrate' && (
               <span className="flex items-center gap-2 text-xs text-muted-foreground">
                 Click 2 court points spanning
@@ -452,12 +617,26 @@ export default function LiveAiTrackerPage() {
                 meters
               </span>
             )}
-            <span className={`ml-auto text-xs px-2.5 py-1 rounded-full ${metersPerUnit ? 'bg-green-500/10 text-green-500' : 'bg-yellow-500/10 text-yellow-500'}`}>
-              {metersPerUnit ? 'Court calibrated' : 'Not calibrated — distances unavailable'}
+            {mode === 'hoop' && <span className="text-xs text-muted-foreground">Click the rim once — enables automatic shot detection.</span>}
+            <span className={`text-xs px-2.5 py-1 rounded-full ${metersPerUnit ? 'bg-green-500/10 text-green-500' : 'bg-yellow-500/10 text-yellow-500'}`}>
+              {metersPerUnit ? 'Court calibrated' : 'Not calibrated'}
+            </span>
+            <span className={`text-xs px-2.5 py-1 rounded-full ${hoopPoint ? 'bg-green-500/10 text-green-500' : 'bg-yellow-500/10 text-yellow-500'}`}>
+              {hoopPoint ? 'Hoop marked' : 'Hoop not marked'}
             </span>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2 mt-2">
+          {/* Team color legend */}
+          <div className="flex items-center gap-4 mt-2 text-xs text-muted-foreground">
+            <span className="flex items-center gap-1.5">
+              <span className="w-3 h-3 rounded-full inline-block" style={{ background: rgbToCss(teamColors[0]) }} /> Team A (auto jersey color)
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="w-3 h-3 rounded-full inline-block" style={{ background: rgbToCss(teamColors[1]) }} /> Team B (auto jersey color)
+            </span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 mt-3">
             <button
               type="button"
               onClick={readJerseysNow}
@@ -467,7 +646,7 @@ export default function LiveAiTrackerPage() {
               {readingJerseys ? 'Reading jersey numbers…' : '🔢 Read jersey numbers (AI)'}
             </button>
             {!db.settings.mistralKey && (
-              <Link href="/dashboard/settings" className="text-xs text-orange-500 hover:underline">Add free Mistral key to enable →</Link>
+              <Link href="/dashboard/settings" className="text-xs text-orange-500 hover:underline">Add free Mistral key to enable AI features →</Link>
             )}
             {jerseyResult && <span className="text-xs text-green-500">{jerseyResult}</span>}
             {jerseyError && <span className="text-xs text-red-500">{jerseyError}</span>}
@@ -491,6 +670,57 @@ export default function LiveAiTrackerPage() {
                     Unassign
                   </button>
                 )}
+              </div>
+            </div>
+          )}
+
+          {/* Shot proposals — human review before anything hits the box score */}
+          {shotProposals.length > 0 && (
+            <div className="mt-4 border border-orange-500 rounded-xl overflow-hidden">
+              <div className="flex items-center justify-between px-3 py-2 bg-orange-500/10 border-b border-orange-500">
+                <p className="text-xs font-semibold text-orange-600 dark:text-orange-400">{shotProposals.length} AI-detected shot(s) — review and accept</p>
+              </div>
+              <div className="max-h-56 overflow-y-auto bg-card">
+                {shotProposals.map((sp) => {
+                  const o = sp.outcome
+                  const shooter = resolvePlayer(o.shooterJersey)
+                  const assister = resolvePlayer(o.assistJersey)
+                  const blocker = resolvePlayer(o.blockedByJersey)
+                  return (
+                    <div key={sp.id} className="flex items-center gap-2 px-3 py-2 text-xs border-b border-border last:border-0">
+                      <span className="tabular-nums text-muted-foreground w-12 shrink-0">{fmtClock(sp.t)}</span>
+                      <span className={`px-1.5 py-0.5 rounded font-semibold shrink-0 ${o.made ? 'bg-green-500/10 text-green-500' : 'bg-red-500/10 text-red-500'}`}>
+                        {o.shotType ?? '2PT'} {o.made ? 'MADE' : 'MISS'}
+                      </span>
+                      <span className="text-foreground truncate flex-1">
+                        {shooter ? `#${shooter.number} ${shooter.name}` : o.shooterJersey ? `#${o.shooterJersey} (not on roster)` : 'shooter unknown'}
+                        {assister && ` · assist #${assister.number} ${assister.name}`}
+                        {blocker && ` · blocked by #${blocker.number} ${blocker.name}`}
+                      </span>
+                      <span className={`shrink-0 ${o.confidence === 'high' ? 'text-green-500' : o.confidence === 'low' ? 'text-red-400' : 'text-yellow-500'}`}>{o.confidence}</span>
+                      <button type="button" onClick={() => acceptShotProposal(sp)} className="shrink-0 px-2 py-1 rounded bg-green-600 text-white font-semibold hover:bg-green-500">Accept</button>
+                      <button type="button" onClick={() => dismissShotProposal(sp.id)} className="shrink-0 text-red-500 hover:underline">✕</button>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Manual review queue — used when no Mistral key is set */}
+          {pendingManual.length > 0 && (
+            <div className="mt-4 border border-border rounded-xl overflow-hidden">
+              <div className="px-3 py-2 bg-muted/30 border-b border-border">
+                <p className="text-xs font-semibold text-foreground">Ball crossed the hoop zone {pendingManual.length}× — add a Mistral key in Settings to auto-confirm, or tag manually below</p>
+              </div>
+              <div className="divide-y divide-border">
+                {pendingManual.map((m) => (
+                  <div key={m.id} className="flex items-center gap-2 px-3 py-2 text-xs">
+                    <span className="tabular-nums text-muted-foreground w-12">{fmtClock(m.t)}</span>
+                    <span className="text-muted-foreground flex-1">Possible shot — use the tag pad to record it for the active player.</span>
+                    <button type="button" onClick={() => dismissManual(m.id)} className="text-red-500 hover:underline">dismiss</button>
+                  </div>
+                ))}
               </div>
             </div>
           )}
@@ -519,7 +749,7 @@ export default function LiveAiTrackerPage() {
                   <button key={b.trackId} type="button" onClick={() => setAssignPopover(b.trackId)}
                     className="w-full flex items-center justify-between px-2.5 py-1.5 text-xs rounded-lg border border-border hover:border-orange-500">
                     <span className={p ? 'text-green-500 font-medium' : 'text-muted-foreground'}>
-                      {p ? `#${p.number} ${p.name}` : `Unassigned track #${b.trackId}`}
+                      {p ? `#${p.number} ${p.name}` : `Team ${(teamIndexByTrack[b.trackId] ?? 0) === 0 ? 'A' : 'B'} · track #${b.trackId}`}
                     </span>
                     <span className="text-muted-foreground">{(b.score * 100).toFixed(0)}%</span>
                   </button>
@@ -597,7 +827,7 @@ export default function LiveAiTrackerPage() {
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-border bg-muted/30">
-                  {['Player', 'PTS', 'REB', 'AST', 'DEFL', 'STL', 'BLK', 'DIST', 'STRIDES', 'MAX SPD'].map((h) => (
+                  {['Player', 'PTS', 'FG', 'REB', 'AST', 'DEFL', 'STL', 'BLK', 'DIST', 'STRIDES', 'MAX SPD'].map((h) => (
                     <th key={h} className="px-3 py-2.5 text-xs uppercase font-medium text-muted-foreground text-center first:text-left first:px-4 whitespace-nowrap">{h}</th>
                   ))}
                 </tr>
@@ -610,6 +840,7 @@ export default function LiveAiTrackerPage() {
                     <tr key={p.id} className="border-b border-border last:border-0">
                       <td className="px-4 py-2.5 font-medium text-foreground whitespace-nowrap">#{p.number} {p.name}</td>
                       <td className="px-3 py-2.5 text-center font-bold tabular-nums">{l.points}</td>
+                      <td className="px-3 py-2.5 text-center tabular-nums">{l.fgm}-{l.fga}</td>
                       <td className="px-3 py-2.5 text-center tabular-nums">{l.reb}</td>
                       <td className="px-3 py-2.5 text-center tabular-nums">{l.ast}</td>
                       <td className="px-3 py-2.5 text-center tabular-nums">{l.defl}</td>

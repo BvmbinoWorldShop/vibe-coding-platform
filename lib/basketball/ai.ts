@@ -148,6 +148,123 @@ Only include events you can actually observe. [] is a valid answer.`,
     }))
 }
 
+// Grabs frames at exact timestamps by seeking — used for reviewing a
+// candidate shot in an uploaded video. Precise regardless of the footage's
+// own pace (fast cuts, sped-up film): seeking is timecode-based, not
+// wall-clock based, so this works the same on high-tempo clips.
+export async function extractFramesAt(
+  video: HTMLVideoElement,
+  timestamps: number[]
+): Promise<{ t: number; dataUrl: string }[]> {
+  const frames: { t: number; dataUrl: string }[] = []
+  const canvas = document.createElement('canvas')
+  const scale = Math.min(1, 640 / (video.videoWidth || 640))
+  canvas.width = Math.round((video.videoWidth || 640) * scale)
+  canvas.height = Math.round((video.videoHeight || 360) * scale)
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('Canvas unavailable')
+  const originalTime = video.currentTime
+  const wasPaused = video.paused
+  video.pause()
+  for (const t of timestamps) {
+    await new Promise<void>((resolve, reject) => {
+      const onSeek = () => {
+        video.removeEventListener('seeked', onSeek)
+        resolve()
+      }
+      video.addEventListener('seeked', onSeek)
+      video.currentTime = Math.max(0, t)
+      setTimeout(() => reject(new Error('Seek timeout')), 5000)
+    }).catch(() => {})
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+    frames.push({ t, dataUrl: canvas.toDataURL('image/jpeg', 0.6) })
+  }
+  video.currentTime = originalTime
+  if (!wasPaused) video.play().catch(() => {})
+  return frames
+}
+
+// Grabs a quick real-time burst (current frame, then a few more a beat
+// later) — used for a live camera feed where seeking backward isn't
+// possible, right after the on-device heuristic flags the ball near the
+// hoop.
+export async function captureBurst(
+  video: HTMLVideoElement,
+  count = 3,
+  gapMs = 280
+): Promise<{ t: number; dataUrl: string }[]> {
+  const canvas = document.createElement('canvas')
+  const scale = Math.min(1, 640 / (video.videoWidth || 640))
+  canvas.width = Math.round((video.videoWidth || 640) * scale)
+  canvas.height = Math.round((video.videoHeight || 360) * scale)
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('Canvas unavailable')
+  const frames: { t: number; dataUrl: string }[] = []
+  const t0 = video.currentTime
+  for (let i = 0; i < count; i++) {
+    if (i > 0) await new Promise((r) => setTimeout(r, gapMs))
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+    frames.push({ t: t0 + (i * gapMs) / 1000, dataUrl: canvas.toDataURL('image/jpeg', 0.6) })
+  }
+  return frames
+}
+
+export interface ShotOutcome {
+  attempted: boolean
+  made: boolean | null
+  shotType: '2PT' | '3PT' | 'FT' | null
+  shooterJersey: number | null
+  assistJersey: number | null
+  hockeyAssistJersey: number | null
+  blockedByJersey: number | null
+  reboundJersey: number | null
+  confidence: 'high' | 'medium' | 'low'
+}
+
+// Confirms what actually happened around a ball-near-hoop moment that the
+// on-device heuristic flagged. A bounding-box tracker cannot tell make from
+// miss or who passed the ball — this is the accuracy step, called only when
+// the heuristic thinks a shot might have happened, so it stays cheap on the
+// free tier even for a full game.
+export async function confirmShotOutcome(
+  mistralKey: string,
+  frames: { t: number; dataUrl: string }[],
+  rosterHint: string
+): Promise<ShotOutcome> {
+  if (!mistralKey) throw new Error('Add a free Mistral API key in Settings first.')
+  const content = [
+    {
+      type: 'text',
+      text: `These ${frames.length} frames are moments right around a basketball approaching the hoop, in order, about 0.3-0.5s apart.
+
+Determine exactly what happened. Our roster (jersey numbers): ${rosterHint || 'unknown'}.
+
+Respond with ONLY this JSON object, no markdown fences:
+{"attempted": true|false, "made": true|false|null, "shotType": "2PT"|"3PT"|"FT"|null, "shooterJersey": <number or null>, "assistJersey": <number or null, the player whose pass led directly to the shot>, "hockeyAssistJersey": <number or null, the pass before the assist pass>, "blockedByJersey": <number or null>, "reboundJersey": <number or null, only if missed and someone grabbed the rebound>, "confidence": "high"|"medium"|"low"}
+
+Set "attempted" to false if this was not actually a shot attempt (e.g. just a pass or dribble near the hoop). Only fill in a jersey number if you can actually read it or are confident from context; otherwise null.`,
+    },
+    ...frames.map((f) => ({ type: 'image_url', image_url: { url: f.dataUrl } })),
+  ]
+  const text = await chat(MISTRAL_URL, mistralKey, MISTRAL_VISION_MODEL, content, 400)
+  const jsonText = text.replace(/```json|```/g, '').trim()
+  const start = jsonText.indexOf('{')
+  const end = jsonText.lastIndexOf('}')
+  if (start === -1 || end === -1) throw new Error('AI gave no usable answer for this shot.')
+  const p = JSON.parse(jsonText.slice(start, end + 1)) as Partial<ShotOutcome>
+  return {
+    attempted: !!p.attempted,
+    made: typeof p.made === 'boolean' ? p.made : null,
+    shotType: p.shotType === '2PT' || p.shotType === '3PT' || p.shotType === 'FT' ? p.shotType : null,
+    shooterJersey: typeof p.shooterJersey === 'number' ? p.shooterJersey : null,
+    assistJersey: typeof p.assistJersey === 'number' ? p.assistJersey : null,
+    hockeyAssistJersey: typeof p.hockeyAssistJersey === 'number' ? p.hockeyAssistJersey : null,
+    blockedByJersey: typeof p.blockedByJersey === 'number' ? p.blockedByJersey : null,
+    reboundJersey: typeof p.reboundJersey === 'number' ? p.reboundJersey : null,
+    confidence: (p.confidence as ShotOutcome['confidence']) ?? 'medium',
+  }
+}
+
 // Reads visible jersey numbers for a set of detected boxes on one frame,
 // using Mistral's vision model as real OCR — not a guess. Boxes are given
 // in fractional 0-1 image coordinates (matches the live tracker's overlay).
