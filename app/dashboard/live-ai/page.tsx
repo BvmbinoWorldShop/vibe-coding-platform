@@ -16,6 +16,7 @@ import {
   type PlayerMovement,
 } from '@/lib/basketball/store'
 import { loadDetector, detectFrame, CentroidTracker, type DetectedBox } from '@/lib/basketball/detector'
+import { readJerseyNumbers } from '@/lib/basketball/ai'
 
 const fmtClock = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
 const DETECT_INTERVAL_MS = 450
@@ -41,6 +42,9 @@ export default function LiveAiTrackerPage() {
   const [boxes, setBoxes] = useState<DetectedBox[]>([])
   const [assignments, setAssignments] = useState<Record<number, string>>({})
   const [assignPopover, setAssignPopover] = useState<number | null>(null)
+  const [readingJerseys, setReadingJerseys] = useState(false)
+  const [jerseyError, setJerseyError] = useState<string | null>(null)
+  const [jerseyResult, setJerseyResult] = useState<string | null>(null)
   const [mode, setMode] = useState<'assign' | 'calibrate'>('assign')
   const [calPoints, setCalPoints] = useState<{ x: number; y: number }[]>([])
   const [calMeters, setCalMeters] = useState(28)
@@ -226,6 +230,52 @@ export default function LiveAiTrackerPage() {
     setAssignPopover(null)
   }
 
+  async function readJerseysNow() {
+    const video = videoRef.current
+    if (!video || video.readyState < 2) return
+    const unassigned = boxes.filter((b) => b.cls === 'person' && !assignmentsRef.current[b.trackId])
+    if (unassigned.length === 0) {
+      setJerseyError('No unassigned people currently detected.')
+      return
+    }
+    setReadingJerseys(true)
+    setJerseyError(null)
+    setJerseyResult(null)
+    try {
+      const canvas = document.createElement('canvas')
+      const scale = Math.min(1, 960 / (video.videoWidth || 960))
+      canvas.width = Math.round((video.videoWidth || 960) * scale)
+      canvas.height = Math.round((video.videoHeight || 540) * scale)
+      const ctx = canvas.getContext('2d')
+      if (!ctx) throw new Error('Canvas unavailable')
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.7)
+      const found = await readJerseyNumbers(
+        db.settings.mistralKey,
+        dataUrl,
+        unassigned.map((b) => ({ id: b.trackId, x: b.x, y: b.y, w: b.w, h: b.h }))
+      )
+      let assignedCount = 0
+      for (const r of found) {
+        if (r.jersey == null) continue
+        const player = db.roster.find((p) => p.number === r.jersey && !Object.values(assignmentsRef.current).includes(p.id))
+        if (player) {
+          assignTrack(r.id, player.id)
+          assignedCount++
+        }
+      }
+      setJerseyResult(
+        assignedCount > 0
+          ? `Read ${found.filter((f) => f.jersey != null).length} number(s), assigned ${assignedCount} player(s).`
+          : `Read numbers on ${found.filter((f) => f.jersey != null).length} of ${unassigned.length} people, but none matched a roster number.`
+      )
+    } catch (err) {
+      setJerseyError(err instanceof Error ? err.message : 'Jersey number reading failed')
+    } finally {
+      setReadingJerseys(false)
+    }
+  }
+
   // Movement summary, recomputed whenever a detection tick lands.
   const movementByPlayer: Record<string, PlayerMovement> = {}
   if (metersPerUnit) {
@@ -306,9 +356,11 @@ export default function LiveAiTrackerPage() {
         from your camera or an uploaded video, and follows each box across frames.
       </p>
       <p className="text-xs text-muted-foreground mb-6">
-        Honest limits: it detects <b>where</b> people and the ball are, not jersey numbers — assign a
-        roster name to a box once and the tracker keeps following it. If a box&apos;s label ever jumps
-        to the wrong player (after two people cross paths), just reassign it.
+        The detector itself only knows <b>where</b> people and the ball are, not who they are — use
+        &quot;Read jersey numbers (AI)&quot; to have Mistral&apos;s vision model read visible numbers and
+        auto-assign matching roster players, or assign a box yourself by clicking it. Either way the
+        tracker then keeps following that box; if two players cross paths and a label jumps to the
+        wrong one, just reassign it.
       </p>
 
       <div className="grid gap-5 lg:grid-cols-[minmax(0,2fr)_minmax(320px,1fr)]">
@@ -403,6 +455,22 @@ export default function LiveAiTrackerPage() {
             <span className={`ml-auto text-xs px-2.5 py-1 rounded-full ${metersPerUnit ? 'bg-green-500/10 text-green-500' : 'bg-yellow-500/10 text-yellow-500'}`}>
               {metersPerUnit ? 'Court calibrated' : 'Not calibrated — distances unavailable'}
             </span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 mt-2">
+            <button
+              type="button"
+              onClick={readJerseysNow}
+              disabled={readingJerseys || !tracking || !db.settings.mistralKey}
+              className="px-3.5 py-2 text-sm font-medium rounded-lg border border-border text-foreground hover:border-orange-500 hover:text-orange-500 disabled:opacity-40"
+            >
+              {readingJerseys ? 'Reading jersey numbers…' : '🔢 Read jersey numbers (AI)'}
+            </button>
+            {!db.settings.mistralKey && (
+              <Link href="/dashboard/settings" className="text-xs text-orange-500 hover:underline">Add free Mistral key to enable →</Link>
+            )}
+            {jerseyResult && <span className="text-xs text-green-500">{jerseyResult}</span>}
+            {jerseyError && <span className="text-xs text-red-500">{jerseyError}</span>}
           </div>
 
           {assignPopover != null && (

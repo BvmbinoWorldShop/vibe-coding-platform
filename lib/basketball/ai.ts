@@ -148,6 +148,40 @@ Only include events you can actually observe. [] is a valid answer.`,
     }))
 }
 
+// Reads visible jersey numbers for a set of detected boxes on one frame,
+// using Mistral's vision model as real OCR — not a guess. Boxes are given
+// in fractional 0-1 image coordinates (matches the live tracker's overlay).
+export async function readJerseyNumbers(
+  mistralKey: string,
+  frameDataUrl: string,
+  boxes: { id: number; x: number; y: number; w: number; h: number }[]
+): Promise<{ id: number; jersey: number | null }[]> {
+  if (!mistralKey) throw new Error('Add a free Mistral API key in Settings first.')
+  if (boxes.length === 0) return []
+  const content = [
+    {
+      type: 'text',
+      text: `This image is a basketball court. Here are bounding boxes (fractional 0-1 image coordinates; x,y = top-left corner, w,h = width/height) for ${boxes.length} detected people:
+
+${boxes.map((b) => `id ${b.id}: x=${b.x.toFixed(3)}, y=${b.y.toFixed(3)}, w=${b.w.toFixed(3)}, h=${b.h.toFixed(3)}`).join('\n')}
+
+For each id, look only inside that box and report the jersey number if it is clearly visible and legible. If the number is not visible, blurred, or you are not confident, report null — do not guess.
+
+Respond with ONLY a JSON array, no markdown fences: [{"id": <box id>, "jersey": <number or null>}]`,
+    },
+    { type: 'image_url', image_url: { url: frameDataUrl } },
+  ]
+  const text = await chat(MISTRAL_URL, mistralKey, MISTRAL_VISION_MODEL, content, 600)
+  const jsonText = text.replace(/```json|```/g, '').trim()
+  const start = jsonText.indexOf('[')
+  const end = jsonText.lastIndexOf(']')
+  if (start === -1 || end === -1) return []
+  const parsed = JSON.parse(jsonText.slice(start, end + 1)) as { id?: number; jersey?: number | null }[]
+  return parsed
+    .filter((p) => typeof p.id === 'number')
+    .map((p) => ({ id: p.id as number, jersey: typeof p.jersey === 'number' ? p.jersey : null }))
+}
+
 // Coaching insights from real recorded stats. Prefers Cerebras (fastest),
 // falls back to Mistral's text model.
 export async function coachingInsights(
