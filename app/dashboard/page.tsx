@@ -2,237 +2,151 @@
 
 import Link from 'next/link'
 import { StatCard } from '@/components/basketball/stat-card'
-import { ShotChart } from '@/components/basketball/court'
-import { games, players, teamSeasonStats, restRecords, workouts } from '@/lib/basketball/mock-data'
+import { useDB, statLine, playerSeason } from '@/lib/basketball/store'
 
-export default function DashboardOverview() {
-  const lastGame = games[0]
-  const todayWorkouts = workouts.filter((w) => w.date === '2026-06-28')
-  const todayRest = restRecords.filter((r) => r.date === '2026-06-28')
-  const avgRecovery = todayRest.length > 0
-    ? Math.round(todayRest.reduce((a, r) => a + r.recoveryScore, 0) / todayRest.length)
-    : 0
+export default function DashboardPage() {
+  const db = useDB()
+  const sessions = [...db.sessions].sort((a, b) => (a.date < b.date ? 1 : -1))
+  const wins = sessions.filter((s) => s.teamScore > s.oppScore).length
+  const losses = sessions.filter((s) => s.teamScore < s.oppScore).length
+  const g = Math.max(sessions.length, 1)
+  const allEvents = sessions.flatMap((s) => s.events)
+  const team = statLine(allEvents)
+  const totalDistance = sessions.reduce(
+    (a, s) => a + Object.values(s.movement).reduce((x, m) => x + m.distanceM, 0),
+    0
+  )
 
-  const topScorer = lastGame.playerStats.reduce((a, b) => (a.points > b.points ? a : b))
-  const topRebounder = lastGame.playerStats.reduce((a, b) => (a.totalRebounds > b.totalRebounds ? a : b))
-  const topAssists = lastGame.playerStats.reduce((a, b) => (a.assists > b.assists ? a : b))
-  const getPlayer = (id: string) => players.find((p) => p.id === id)
+  const leaders = db.roster
+    .map((p) => ({ p, s: playerSeason(db.sessions, p.id) }))
+    .filter((x) => x.s.played > 0)
+    .sort((a, b) => b.s.totals.points - a.s.totals.points)
+    .slice(0, 5)
+
+  const empty = sessions.length === 0
 
   return (
     <div className="p-4 md:p-8 max-w-[1400px]">
-      <div className="flex items-center justify-between mb-8">
-        <div>
-          <h1 className="text-2xl font-bold text-foreground">Dashboard</h1>
-          <p className="text-sm text-muted-foreground mt-1">Season overview and recent activity</p>
-        </div>
-        <div className="flex items-center gap-2 text-sm text-muted-foreground">
-          <span className="w-2 h-2 rounded-full bg-green-500" />
-          Season Active
-        </div>
-      </div>
+      <h1 className="text-2xl font-bold text-foreground mb-1">{db.settings.teamName}</h1>
+      <p className="text-sm text-muted-foreground mb-6">
+        {empty
+          ? 'Real stats only — everything below fills in as you record games.'
+          : `${sessions.length} recorded games · all stats measured, nothing simulated`}
+      </p>
 
-      {/* Season Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4 mb-8">
-        <StatCard label="Record" value={`${teamSeasonStats.wins}-${teamSeasonStats.losses}`} subValue=".704 Win %" />
-        <StatCard label="PPG" value={teamSeasonStats.pointsPerGame} trend="up" trendValue="2.1" />
-        <StatCard label="OPP PPG" value={teamSeasonStats.oppPointsPerGame} trend="down" trendValue="1.3" />
-        <StatCard label="FG%" value={`${teamSeasonStats.fgPercentage}%`} trend="up" trendValue="0.8" />
-        <StatCard label="3PT%" value={`${teamSeasonStats.threePtPercentage}%`} trend="up" trendValue="1.2" />
-        <StatCard label="RPG" value={teamSeasonStats.reboundsPerGame} trend="neutral" trendValue="0.2" />
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
-        {/* Last Game Summary */}
-        <div className="lg:col-span-2 bg-card border border-border rounded-xl p-6">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-lg font-semibold text-foreground">Last Game</h2>
-            <Link href={`/dashboard/games/${lastGame.id}`} className="text-sm text-blue-500 hover:underline">
-              Full Details
+      {empty ? (
+        <div className="bg-card border border-border rounded-xl p-8 md:p-12 text-center mb-8">
+          <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-orange-500 to-red-600 flex items-center justify-center mx-auto mb-4">
+            <svg viewBox="0 0 24 24" className="w-8 h-8 text-white" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="12" cy="12" r="10" />
+              <path d="M4.93 4.93c4.08 4.08 10.06 4.08 14.14 0M4.93 19.07c4.08-4.08 10.06-4.08 14.14 0M12 2v20" />
+            </svg>
+          </div>
+          <h2 className="text-xl font-bold text-foreground mb-2">Start tracking real basketball</h2>
+          <p className="text-sm text-muted-foreground max-w-md mx-auto mb-6">
+            Build your roster, then record a game courtside or break down film with AI-assisted video
+            analysis. Every number on this platform comes from what you actually track.
+          </p>
+          <div className="flex flex-wrap gap-3 justify-center">
+            <Link href="/dashboard/players"
+              className="px-5 py-2.5 text-sm font-semibold rounded-lg bg-orange-600 text-white hover:bg-orange-500">
+              1 · Add roster
+            </Link>
+            <Link href="/dashboard/live"
+              className="px-5 py-2.5 text-sm font-medium rounded-lg border border-border text-foreground hover:bg-accent/50">
+              2 · Record live game
+            </Link>
+            <Link href="/dashboard/video"
+              className="px-5 py-2.5 text-sm font-medium rounded-lg border border-border text-foreground hover:bg-accent/50">
+              3 · Analyze video with AI
             </Link>
           </div>
-          <div className="flex items-center justify-between mb-6">
-            <div className="text-center">
-              <p className="text-3xl font-bold text-foreground">{lastGame.teamScore}</p>
-              <p className="text-sm text-muted-foreground mt-1">Our Team</p>
-            </div>
-            <div className="px-4">
-              <span className={`text-lg font-bold px-3 py-1 rounded ${lastGame.result === 'W' ? 'bg-green-500/10 text-green-500' : 'bg-red-500/10 text-red-500'}`}>
-                {lastGame.result === 'W' ? 'WIN' : 'LOSS'}
-              </span>
-              <p className="text-xs text-muted-foreground text-center mt-2">{lastGame.date}</p>
-            </div>
-            <div className="text-center">
-              <p className="text-3xl font-bold text-foreground">{lastGame.opponentScore}</p>
-              <p className="text-sm text-muted-foreground mt-1">{lastGame.opponent}</p>
-            </div>
+        </div>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-8">
+            <StatCard label="Record" value={`${wins}–${losses}`} size="sm" />
+            <StatCard label="PPG" value={(sessions.reduce((a, s) => a + s.teamScore, 0) / g).toFixed(1)} size="sm" />
+            <StatCard label="Opp PPG" value={(sessions.reduce((a, s) => a + s.oppScore, 0) / g).toFixed(1)} size="sm" />
+            <StatCard label="Deflections" value={team.defl} subValue={`${(team.defl / g).toFixed(1)} per game`} size="sm" />
+            <StatCard label="Hockey Assists" value={team.hast} subValue={`${(team.hast / g).toFixed(1)} per game`} size="sm" />
+            <StatCard label="Distance Tracked" value={totalDistance > 0 ? `${(totalDistance / 1000).toFixed(1)} km` : '—'} size="sm" />
           </div>
 
-          {/* Quarter scores */}
-          <div className="grid grid-cols-4 gap-2 mb-6">
-            {lastGame.quarterScores.map((q) => (
-              <div key={q.quarter} className="bg-muted/50 rounded-lg p-3 text-center">
-                <p className="text-xs text-muted-foreground">Q{q.quarter}</p>
-                <p className="text-sm font-bold text-foreground">{q.teamScore}-{q.opponentScore}</p>
-                <p className="text-xs text-muted-foreground">{q.fgPercentage}% FG</p>
+          <div className="grid gap-5 lg:grid-cols-2 mb-8">
+            <div className="bg-card border border-border rounded-xl overflow-hidden">
+              <div className="p-4 border-b border-border flex items-center justify-between">
+                <h2 className="text-lg font-semibold text-foreground">Recent Games</h2>
+                <Link href="/dashboard/games" className="text-xs text-orange-500 hover:underline">All games →</Link>
               </div>
-            ))}
-          </div>
-
-          {/* Top performers */}
-          <div className="grid grid-cols-3 gap-4">
-            <div className="bg-muted/30 rounded-lg p-3">
-              <p className="text-xs text-muted-foreground">Top Scorer</p>
-              <p className="text-sm font-bold text-foreground">{getPlayer(topScorer.playerId)?.firstName} {getPlayer(topScorer.playerId)?.lastName}</p>
-              <p className="text-lg font-bold text-foreground">{topScorer.points} PTS</p>
-              <p className="text-xs text-muted-foreground">{topScorer.fgMade}/{topScorer.fgAttempted} FG</p>
-            </div>
-            <div className="bg-muted/30 rounded-lg p-3">
-              <p className="text-xs text-muted-foreground">Top Rebounder</p>
-              <p className="text-sm font-bold text-foreground">{getPlayer(topRebounder.playerId)?.firstName} {getPlayer(topRebounder.playerId)?.lastName}</p>
-              <p className="text-lg font-bold text-foreground">{topRebounder.totalRebounds} REB</p>
-              <p className="text-xs text-muted-foreground">{topRebounder.offRebounds} OFF / {topRebounder.defRebounds} DEF</p>
-            </div>
-            <div className="bg-muted/30 rounded-lg p-3">
-              <p className="text-xs text-muted-foreground">Top Assists</p>
-              <p className="text-sm font-bold text-foreground">{getPlayer(topAssists.playerId)?.firstName} {getPlayer(topAssists.playerId)?.lastName}</p>
-              <p className="text-lg font-bold text-foreground">{topAssists.assists} AST</p>
-              <p className="text-xs text-muted-foreground">{topAssists.hockeyAssists} Hockey AST</p>
-            </div>
-          </div>
-        </div>
-
-        {/* Shot Chart Preview */}
-        <div className="bg-card border border-border rounded-xl p-6">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-lg font-semibold text-foreground">Shot Chart</h2>
-            <Link href={`/dashboard/games/${lastGame.id}`} className="text-sm text-blue-500 hover:underline">
-              View Full
-            </Link>
-          </div>
-          <div className="flex justify-center">
-            <ShotChart shots={lastGame.shots} width={350} height={330} />
-          </div>
-          <div className="flex justify-center gap-6 mt-4">
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <span className="w-3 h-3 rounded-full bg-green-500" /> Made
-            </div>
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <span className="w-3 h-3 rounded-full bg-red-500" /> Missed
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
-        {/* Team Recovery Status */}
-        <div className="bg-card border border-border rounded-xl p-6">
-          <h2 className="text-lg font-semibold text-foreground mb-4">Team Recovery Status</h2>
-          <div className="flex items-center gap-4 mb-4">
-            <div className="w-16 h-16 rounded-full border-4 border-green-500 flex items-center justify-center">
-              <span className="text-xl font-bold text-foreground">{avgRecovery}</span>
-            </div>
-            <div>
-              <p className="text-sm font-medium text-foreground">Avg Recovery Score</p>
-              <p className="text-xs text-muted-foreground">{todayRest.length} players reported today</p>
-            </div>
-          </div>
-          <div className="space-y-3">
-            {todayRest.map((r) => {
-              const pl = getPlayer(r.playerId)
-              return (
-                <div key={r.id} className="flex items-center justify-between py-2 border-b border-border last:border-0">
-                  <div className="flex items-center gap-3">
-                    <div className="w-8 h-8 rounded-full bg-muted flex items-center justify-center text-xs font-bold">
-                      {pl?.number}
+              {sessions.slice(0, 5).map((s) => {
+                const r = s.teamScore > s.oppScore ? 'W' : s.teamScore < s.oppScore ? 'L' : '—'
+                return (
+                  <Link key={s.id} href={`/dashboard/games/view?id=${s.id}`}
+                    className="flex items-center gap-3 px-4 py-3 border-b border-border last:border-0 hover:bg-muted/20">
+                    <span className={`w-8 h-8 rounded-lg flex items-center justify-center text-sm font-bold shrink-0 ${
+                      r === 'W' ? 'bg-green-500/10 text-green-500' : r === 'L' ? 'bg-red-500/10 text-red-500' : 'bg-muted text-muted-foreground'
+                    }`}>{r}</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-foreground truncate">
+                        {s.location === 'away' ? '@' : 'vs'} {s.opponent}
+                      </p>
+                      <p className="text-xs text-muted-foreground">{s.date}</p>
                     </div>
-                    <div>
-                      <p className="text-sm font-medium text-foreground">{pl?.firstName} {pl?.lastName}</p>
-                      <p className="text-xs text-muted-foreground">{r.sleepHours}h sleep</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className={`text-xs px-2 py-0.5 rounded-full ${
-                      r.soreness === 'none' ? 'bg-green-500/10 text-green-500' :
-                      r.soreness === 'mild' ? 'bg-yellow-500/10 text-yellow-500' :
-                      r.soreness === 'moderate' ? 'bg-orange-500/10 text-orange-500' :
-                      'bg-red-500/10 text-red-500'
-                    }`}>
-                      {r.soreness}
-                    </span>
-                    <span className="text-sm font-bold text-foreground w-8 text-right">{r.recoveryScore}</span>
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </div>
+                    <span className="font-bold tabular-nums text-foreground">{s.teamScore}–{s.oppScore}</span>
+                  </Link>
+                )
+              })}
+            </div>
 
-        {/* Today's Workouts */}
-        <div className="bg-card border border-border rounded-xl p-6">
-          <h2 className="text-lg font-semibold text-foreground mb-4">Today&apos;s Workouts</h2>
-          <div className="space-y-3">
-            {todayWorkouts.map((w) => {
-              const pl = getPlayer(w.playerId)
-              return (
-                <div key={w.id} className="flex items-center justify-between py-2 border-b border-border last:border-0">
-                  <div className="flex items-center gap-3">
-                    <div className={`w-2 h-2 rounded-full ${w.completed ? 'bg-green-500' : 'bg-muted-foreground'}`} />
-                    <div>
-                      <p className="text-sm font-medium text-foreground">{pl?.firstName} {pl?.lastName}</p>
-                      <p className="text-xs text-muted-foreground">{w.type} - {w.duration} min</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className={`text-xs px-2 py-0.5 rounded-full ${
-                      w.intensity === 'high' ? 'bg-red-500/10 text-red-500' :
-                      w.intensity === 'medium' ? 'bg-yellow-500/10 text-yellow-500' :
-                      'bg-green-500/10 text-green-500'
-                    }`}>
-                      {w.intensity}
-                    </span>
-                    <span className={`text-xs font-medium ${w.completed ? 'text-green-500' : 'text-muted-foreground'}`}>
-                      {w.completed ? 'Done' : 'Pending'}
-                    </span>
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </div>
-      </div>
-
-      {/* Roster Quick View */}
-      <div className="bg-card border border-border rounded-xl p-6">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-semibold text-foreground">Roster</h2>
-          <Link href="/dashboard/players" className="text-sm text-blue-500 hover:underline">
-            Manage Players
-          </Link>
-        </div>
-        <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-          {players.slice(0, 10).map((p) => (
-            <Link key={p.id} href={`/dashboard/players/${p.id}`} className="bg-muted/30 rounded-lg p-3 hover:bg-muted/50 transition-colors">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white text-sm font-bold">
-                  {p.number}
-                </div>
-                <div>
-                  <p className="text-sm font-medium text-foreground">{p.firstName} {p.lastName.charAt(0)}.</p>
-                  <p className="text-xs text-muted-foreground">{p.position} | {p.height}</p>
-                </div>
+            <div className="bg-card border border-border rounded-xl overflow-hidden">
+              <div className="p-4 border-b border-border flex items-center justify-between">
+                <h2 className="text-lg font-semibold text-foreground">Scoring Leaders</h2>
+                <Link href="/dashboard/players" className="text-xs text-orange-500 hover:underline">All players →</Link>
               </div>
-              <div className="mt-2">
-                <span className={`text-xs px-2 py-0.5 rounded-full ${
-                  p.status === 'active' ? 'bg-green-500/10 text-green-500' :
-                  p.status === 'injured' ? 'bg-red-500/10 text-red-500' :
-                  'bg-yellow-500/10 text-yellow-500'
-                }`}>
-                  {p.status}
-                </span>
-              </div>
-            </Link>
-          ))}
-        </div>
+              {leaders.length === 0 ? (
+                <p className="p-6 text-sm text-muted-foreground text-center">No player stats yet.</p>
+              ) : (
+                leaders.map(({ p, s }) => (
+                  <Link key={p.id} href={`/dashboard/players/profile?id=${p.id}`}
+                    className="flex items-center gap-3 px-4 py-3 border-b border-border last:border-0 hover:bg-muted/20">
+                    <span className="w-8 h-8 rounded-full bg-gradient-to-br from-orange-500 to-red-600 text-white flex items-center justify-center text-xs font-bold shrink-0">
+                      {p.number}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-foreground truncate">{p.name}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {s.played} games · {s.totals.defl} defl · {s.totals.hast} hcky ast
+                      </p>
+                    </div>
+                    <span className="font-bold tabular-nums text-foreground">
+                      {(s.totals.points / Math.max(s.played, 1)).toFixed(1)} <span className="text-xs text-muted-foreground font-normal">ppg</span>
+                    </span>
+                  </Link>
+                ))
+              )}
+            </div>
+          </div>
+        </>
+      )}
+
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <Link href="/dashboard/live" className="bg-card border border-border rounded-xl p-5 hover:border-orange-500 transition-colors">
+          <p className="font-semibold text-foreground mb-1">🔴 Live Recorder</p>
+          <p className="text-xs text-muted-foreground">Tag stats courtside as the game happens — score builds itself.</p>
+        </Link>
+        <Link href="/dashboard/live-ai" className="bg-card border border-border rounded-xl p-5 hover:border-orange-500 transition-colors">
+          <p className="font-semibold text-foreground mb-1">🧠 Live AI Tracker</p>
+          <p className="text-xs text-muted-foreground">On-device AI detects players and the ball live, auto-tracks movement.</p>
+        </Link>
+        <Link href="/dashboard/video" className="bg-card border border-border rounded-xl p-5 hover:border-orange-500 transition-colors">
+          <p className="font-semibold text-foreground mb-1">🎥 Video Analysis</p>
+          <p className="text-xs text-muted-foreground">Upload film. AI proposes events from the clip; you confirm.</p>
+        </Link>
+        <Link href="/dashboard/pro" className="bg-card border border-border rounded-xl p-5 hover:border-orange-500 transition-colors">
+          <p className="font-semibold text-foreground mb-1">🌍 Pro Leagues</p>
+          <p className="text-xs text-muted-foreground">Live results from 13 world leagues + pro player scouting search.</p>
+        </Link>
       </div>
     </div>
   )
