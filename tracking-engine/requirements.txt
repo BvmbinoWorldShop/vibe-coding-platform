@@ -1,0 +1,15 @@
+# Pro tracking engine — all open source, all free.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+httpx==0.28.1
+pydantic==2.10.4
+
+# Computer vision (installs torch automatically). For GPU acceleration install
+# the CUDA build of torch first per https://pytorch.org, then this file.
+ultralytics==8.3.58
+opencv-python-headless==4.10.0.84
+numpy==2.2.1
+
+# Optional: on-device jersey OCR. Uncomment to enable (large-ish download).
+# easyocr==1.7.2

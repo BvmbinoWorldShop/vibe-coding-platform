@@ -9,13 +9,15 @@ export default function SettingsPage() {
   const [teamName, setTeamName] = useState<string | null>(null)
   const [mistralKey, setMistralKey] = useState<string | null>(null)
   const [cerebrasKey, setCerebrasKey] = useState<string | null>(null)
+  const [proUrl, setProUrl] = useState<string | null>(null)
   const [status, setStatus] = useState<{ ok: boolean; msg: string } | null>(null)
-  const [testing, setTesting] = useState<'mistral' | 'cerebras' | null>(null)
+  const [testing, setTesting] = useState<'mistral' | 'cerebras' | 'engine' | null>(null)
   const [confirmClear, setConfirmClear] = useState(false)
 
   const shownTeam = teamName ?? db.settings.teamName
   const shownMistral = mistralKey ?? db.settings.mistralKey
   const shownCerebras = cerebrasKey ?? db.settings.cerebrasKey
+  const shownProUrl = proUrl ?? db.settings.proEngineUrl
 
   function save() {
     updateDB((d) => ({
@@ -25,9 +27,29 @@ export default function SettingsPage() {
         teamName: shownTeam.trim() || 'My Team',
         mistralKey: shownMistral.trim(),
         cerebrasKey: shownCerebras.trim(),
+        proEngineUrl: shownProUrl.trim().replace(/\/$/, ''),
       },
     }))
     setStatus({ ok: true, msg: 'Settings saved.' })
+  }
+
+  async function testEngine() {
+    setTesting('engine')
+    setStatus(null)
+    try {
+      const res = await fetch(`${shownProUrl.trim().replace(/\/$/, '')}/health`)
+      const data = await res.json()
+      setStatus({
+        ok: data.status === 'ok',
+        msg: data.cv_ready
+          ? 'Pro engine reachable — CV stack ready.'
+          : `Engine reachable but CV deps missing: ${data.detail ?? ''}`,
+      })
+    } catch {
+      setStatus({ ok: false, msg: 'Could not reach the engine — check the URL and that it is running.' })
+    } finally {
+      setTesting(null)
+    }
   }
 
   async function runTest(provider: 'mistral' | 'cerebras') {
@@ -158,6 +180,31 @@ export default function SettingsPage() {
       </div>
 
       <div className="bg-card border border-border rounded-xl p-5 mb-5">
+        <h2 className="text-lg font-semibold text-foreground mb-1">Pro Tracking Engine</h2>
+        <p className="text-xs text-muted-foreground mb-4">
+          Optional self-hosted backend (YOLOv8 + ByteTrack) for arena-grade tracking on your own GPU.
+          Leave blank to use the built-in in-browser tracker. See <code>tracking-engine/README.md</code>.
+        </p>
+        <label className="block text-sm text-muted-foreground mb-1">Engine URL</label>
+        <div className="flex flex-wrap gap-2">
+          <input
+            value={shownProUrl}
+            onChange={(e) => setProUrl(e.target.value)}
+            placeholder="http://localhost:8000"
+            className="flex-1 min-w-[240px] px-4 py-2.5 text-sm rounded-lg bg-background border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-orange-500/50"
+          />
+          <button
+            type="button"
+            onClick={testEngine}
+            disabled={testing !== null || !shownProUrl.trim()}
+            className="px-4 py-2.5 text-sm font-medium rounded-lg border border-border text-foreground hover:bg-accent/50 disabled:opacity-40"
+          >
+            {testing === 'engine' ? 'Checking…' : 'Test connection'}
+          </button>
+        </div>
+      </div>
+
+      <div className="bg-card border border-border rounded-xl p-5 mb-5">
         <h2 className="text-lg font-semibold text-foreground mb-3">Your data</h2>
         <p className="text-xs text-muted-foreground mb-4">
           {db.roster.length} players · {db.sessions.length} recorded sessions · {db.workouts.length}{' '}
@@ -197,7 +244,7 @@ export default function SettingsPage() {
                   sessions: [],
                   workouts: [],
                   recovery: [],
-                  settings: { teamName: 'My Team', mistralKey: '', cerebrasKey: '' },
+                  settings: { teamName: 'My Team', mistralKey: '', cerebrasKey: '', proEngineUrl: '' },
                 }))
                 setConfirmClear(false)
               }}
