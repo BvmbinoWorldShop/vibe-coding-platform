@@ -22,6 +22,7 @@ import {
   CentroidTracker,
   sampleTorsoColor,
   clusterIntoTeams,
+  detectBallByColor,
   rgbToCss,
   rgbToHex,
   pointInPolygon,
@@ -66,6 +67,8 @@ export default function LiveAiTrackerPage() {
   const fpsRef = useRef({ frames: 0, last: 0 })
   const lastBallRef = useRef<{ x: number; y: number; t: number } | null>(null)
   const displayRef = useRef<Record<number, { x: number; y: number; w: number; h: number }>>({})
+  const autoScoreRef = useRef(true)
+  const activePlayerRef = useRef('')
 
   const [source, setSource] = useState<'none' | 'file' | 'camera'>('none')
   const [fileName, setFileName] = useState('')
@@ -78,6 +81,7 @@ export default function LiveAiTrackerPage() {
   const [assignments, setAssignments] = useState<Record<number, string>>({})
   const [assignPopover, setAssignPopover] = useState<number | null>(null)
   const [autoEnroll, setAutoEnroll] = useState(false)
+  const [autoScore, setAutoScore] = useState(true)
   const [npName, setNpName] = useState('')
   const [npNumber, setNpNumber] = useState('')
   const [npColor, setNpColor] = useState('#f97316')
@@ -125,6 +129,12 @@ export default function LiveAiTrackerPage() {
   useEffect(() => {
     autoStatScanRef.current = autoStatScan
   }, [autoStatScan])
+  useEffect(() => {
+    autoScoreRef.current = autoScore
+  }, [autoScore])
+  useEffect(() => {
+    activePlayerRef.current = activePlayer
+  }, [activePlayer])
   useEffect(() => {
     // The court region is only active once all 4 corners are marked.
     courtPolyRef.current = courtPoints.length === 4 ? courtPoints : null
@@ -214,9 +224,12 @@ export default function LiveAiTrackerPage() {
     [db.roster]
   )
 
-  const pushEvent = useCallback((playerId: string, type: string, t: number) => {
-    setEvents((prev) => [...prev, { id: uid(), t, playerId, type }].sort((a, b) => a.t - b.t))
-  }, [])
+  const pushEvent = useCallback(
+    (playerId: string, type: string, t: number, shot?: { x: number; y: number }) => {
+      setEvents((prev) => [...prev, { id: uid(), t, playerId, type, ...(shot ? { shot } : {}) }].sort((a, b) => a.t - b.t))
+    },
+    []
+  )
 
   const applyShotOutcome = useCallback(
     (t: number, outcome: ShotOutcome) => {
@@ -343,14 +356,20 @@ export default function LiveAiTrackerPage() {
       if (video && model && video.readyState >= 2 && runningRef.current) {
         try {
           const rawDets = await detectFrame(model, video, 0.4, 0.18)
-          // On-court vision only for people (drop crowd/bench by feet position),
-          // but the ball is NEVER filtered — it flies above the rim and past
-          // the sidelines, and we want it recognized at all times.
+          // People go through the tracker; the ball is handled separately by
+          // the color detector (far more reliable for a basketball). On-court
+          // mask applies to people only.
           const poly = courtPolyRef.current
-          const dets = poly
-            ? rawDets.filter((d) => d.cls === 'sports ball' || pointInPolygon(d.x + d.w / 2, d.y + d.h, poly))
-            : rawDets
-          const tracked = trackerRef.current.update(dets)
+          const personDets = rawDets.filter(
+            (d) => d.cls === 'person' && (!poly || pointInPolygon(d.x + d.w / 2, d.y + d.h, poly))
+          )
+          const tracked = trackerRef.current.update(personDets)
+
+          // Ball: color detector first (biased to last position), COCO-SSD as
+          // a fallback. This is what actually follows a basketball.
+          const colorBall = detectBallByColor(video, lastBallRef.current)
+          const cocoBall = rawDets.find((d) => d.cls === 'sports ball')
+          const ballDet = colorBall ?? (cocoBall ? { x: cocoBall.x, y: cocoBall.y, w: cocoBall.w, h: cocoBall.h, score: cocoBall.score } : null)
           // Display smoothing: ease player boxes toward their new position to
           // kill per-frame jitter (the ball is left un-smoothed so it stays
           // snappy). All the internal math below still uses the raw `tracked`
@@ -369,7 +388,11 @@ export default function LiveAiTrackerPage() {
             disp[b.trackId] = { x: nb.x, y: nb.y, w: nb.w, h: nb.h }
             return nb
           })
-          setBoxes(smoothed)
+          // Draw the ball (synthetic box, trackId -1) on top of the players.
+          const displayBoxes: DetectedBox[] = ballDet
+            ? [...smoothed, { trackId: -1, cls: 'sports ball' as const, x: ballDet.x, y: ballDet.y, w: ballDet.w, h: ballDet.h, score: ballDet.score }]
+            : smoothed
+          setBoxes(displayBoxes)
           const t = now()
 
           // Movement accrual for assigned players.
@@ -422,12 +445,10 @@ export default function LiveAiTrackerPage() {
             }
           }
 
-          // Ball-near-hoop heuristic — a cheap, on-device trigger for the
-          // (rate-limited) AI confirmation step, not a made/miss call itself.
-          const ball = tracked.find((b) => b.cls === 'sports ball')
-          if (ball) {
-            const cx = ball.x + ball.w / 2
-            const cy = ball.y + ball.h / 2
+          // Ball tracking + shot detection from the color-detected ball.
+          if (ballDet) {
+            const cx = ballDet.x + ballDet.w / 2
+            const cy = ballDet.y + ballDet.h / 2
             lastBallRef.current = { x: cx, y: cy, t }
             const hist = ballHistoryRef.current
             hist.push({ t, x: cx, y: cy })
@@ -436,7 +457,31 @@ export default function LiveAiTrackerPage() {
             if (hoop && hist.length >= 2 && t - lastShotCheckRef.current > SHOT_COOLDOWN_S) {
               const dist = Math.hypot(cx - hoop.x, cy - hoop.y)
               if (dist < HOOP_TRIGGER_RADIUS) {
-                handleCandidateShot(t, analyzeMake(hoop))
+                const made = analyzeMake(hoop)
+                if (autoScoreRef.current) {
+                  // Offline auto-score: record the shot immediately to whoever
+                  // was closest to the ball (or the active player), no AI key
+                  // needed. This is what makes the basic box score fill in.
+                  lastShotCheckRef.current = t
+                  let shooter = activePlayerRef.current
+                  let bestD = Infinity
+                  for (const b of tracked) {
+                    const pid = assignmentsRef.current[b.trackId]
+                    if (!pid) continue
+                    const d = Math.hypot(b.x + b.w / 2 - cx, b.y + b.h / 2 - cy)
+                    if (d < bestD) {
+                      bestD = d
+                      shooter = pid
+                    }
+                  }
+                  if (shooter) {
+                    pushEvent(shooter, made ? 'fg2m' : 'fg2x', t, { x: cx * 100, y: cy * 100 })
+                    setFlash(made ? 'MADE (auto)' : 'MISS (auto)')
+                    setTimeout(() => setFlash(null), 900)
+                  }
+                } else {
+                  handleCandidateShot(t, made)
+                }
               }
             }
           }
@@ -463,7 +508,7 @@ export default function LiveAiTrackerPage() {
       loopActiveRef.current = false
       cancelAnimationFrame(raf)
     }
-  }, [tracking, now, handleCandidateShot, analyzeMake, createParticipant, peekFreeNumber])
+  }, [tracking, now, handleCandidateShot, analyzeMake, createParticipant, peekFreeNumber, pushEvent])
 
   const addTag = useCallback(
     (type: string) => {
@@ -735,10 +780,11 @@ export default function LiveAiTrackerPage() {
         assists, deflections and hustle plays for all players continuously.
       </p>
       <p className="text-xs text-muted-foreground mb-6">
-        Give any box its own number and color (great for pickup games with no roster). Mark the rim
-        once and a ball dropping through it counts a make automatically; the AI vision check confirms
-        make/miss, shooter, assist and block. Everything lands in a review queue you approve — nothing
-        is silently miscounted. AI features use your free Mistral key from Settings.
+        The ball is tracked by its orange color (far more reliable than a generic model), so it keeps
+        following it. With <b>Auto-score shots</b> on, a ball dropping through the marked rim is
+        recorded as a make/miss for the nearest player automatically — no AI key needed, and the basic
+        box score fills in live. (Turn it off to send shots to the AI review queue instead.) Give any
+        box its own number and color for pickup games with no roster.
       </p>
 
       <div className="grid gap-5 lg:grid-cols-[minmax(0,2fr)_minmax(320px,1fr)]">
@@ -942,6 +988,13 @@ export default function LiveAiTrackerPage() {
               className={`px-3.5 py-2 text-sm font-medium rounded-lg border ${autoEnroll ? 'border-green-500 bg-green-500/10 text-green-500' : 'border-border text-muted-foreground hover:text-foreground'}`}
             >
               {autoEnroll ? '● Auto-enroll ON' : 'Auto-enroll players'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setAutoScore((v) => !v)}
+              className={`px-3.5 py-2 text-sm font-medium rounded-lg border ${autoScore ? 'border-green-500 bg-green-500/10 text-green-500' : 'border-border text-muted-foreground hover:text-foreground'}`}
+            >
+              {autoScore ? '● Auto-score shots ON' : 'Auto-score shots'}
             </button>
             <button
               type="button"
