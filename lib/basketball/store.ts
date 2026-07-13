@@ -77,6 +77,7 @@ export interface AppSettings {
   teamName: string
   mistralKey: string
   cerebrasKey: string
+  proEngineUrl: string // URL of the self-hosted pro tracking engine (optional)
 }
 
 export interface DB {
@@ -123,7 +124,7 @@ const EMPTY: DB = {
   sessions: [],
   workouts: [],
   recovery: [],
-  settings: { teamName: 'My Team', mistralKey: '', cerebrasKey: '' },
+  settings: { teamName: 'My Team', mistralKey: '', cerebrasKey: '', proEngineUrl: '' },
 }
 
 let cache: DB | null = null
