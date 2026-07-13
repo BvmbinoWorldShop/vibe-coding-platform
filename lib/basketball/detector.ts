@@ -37,7 +37,10 @@ export async function loadDetector(): Promise<CocoModel> {
       await tf.setBackend('webgl').catch(() => tf.setBackend('cpu'))
       await tf.ready()
       const cocoSsd = await import('@tensorflow-models/coco-ssd')
-      return cocoSsd.load({ base: 'lite_mobilenet_v2' }) as unknown as Promise<CocoModel>
+      // mobilenet_v2 is the most accurate COCO-SSD base — noticeably better at
+      // locating a player/ball than the "lite" base, and fast enough on a GPU
+      // for the handful of objects on a court.
+      return cocoSsd.load({ base: 'mobilenet_v2' }) as unknown as Promise<CocoModel>
     })()
   }
   return modelPromise
