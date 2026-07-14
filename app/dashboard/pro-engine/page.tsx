@@ -15,6 +15,8 @@ export default function ProEnginePage() {
   const router = useRouter()
   const fileRef = useRef<HTMLInputElement>(null)
   const [file, setFile] = useState<File | null>(null)
+  const [frameUrl, setFrameUrl] = useState<string | null>(null)
+  const [corners, setCorners] = useState<{ x: number; y: number }[]>([])
   const [courtType, setCourtType] = useState<'full' | 'half'>('full')
   const [detector, setDetector] = useState('yolov8m')
   const [busy, setBusy] = useState(false)
@@ -47,6 +49,45 @@ export default function ProEnginePage() {
     }
   }, [engineUrl])
 
+  // Pull a representative frame from the chosen clip so the court corners can
+  // be marked on it (calibration → metric speed/distance).
+  function onPickFile(f: File | null) {
+    setFile(f)
+    setFrameUrl(null)
+    setCorners([])
+    if (!f) return
+    const v = document.createElement('video')
+    v.preload = 'auto'
+    v.muted = true
+    v.src = URL.createObjectURL(f)
+    v.onloadeddata = () => {
+      v.currentTime = Math.min(1, (v.duration || 2) / 2)
+    }
+    v.onseeked = () => {
+      const c = document.createElement('canvas')
+      c.width = v.videoWidth
+      c.height = v.videoHeight
+      c.getContext('2d')?.drawImage(v, 0, 0)
+      setFrameUrl(c.toDataURL('image/jpeg', 0.8))
+      URL.revokeObjectURL(v.src)
+    }
+    v.onerror = () => URL.revokeObjectURL(v.src)
+  }
+
+  // Map the 4 clicked corners (in the labelled order) to real court meters.
+  function cornerPayload() {
+    if (corners.length !== 4) return []
+    const L = courtType === 'full' ? 28 : 14
+    const W = 15
+    const courtPts = [
+      [0, L], // 1 far-left
+      [W, L], // 2 far-right
+      [W, 0], // 3 near-right
+      [0, 0], // 4 near-left
+    ]
+    return corners.map((c, i) => ({ x: c.x, y: c.y, court_x_m: courtPts[i][0], court_y_m: courtPts[i][1] }))
+  }
+
   async function runAnalysis() {
     if (!file || !engineUrl) return
     setBusy(true)
@@ -56,7 +97,7 @@ export default function ProEnginePage() {
     try {
       const form = new FormData()
       form.append('video', file)
-      form.append('options', JSON.stringify({ court_type: courtType, detector, corners: [], fps_sample: 5 }))
+      form.append('options', JSON.stringify({ court_type: courtType, detector, corners: cornerPayload(), fps_sample: 5 }))
       const res = await fetch(`${engineUrl}/analyze`, { method: 'POST', body: form })
       if (!res.ok) throw new Error(`Engine returned HTTP ${res.status}`)
       const { jobId } = await res.json()
@@ -159,9 +200,52 @@ export default function ProEnginePage() {
       <div className="bg-card border border-border rounded-xl p-5 mb-5 space-y-4">
         <div>
           <label className="block text-xs text-muted-foreground mb-1">Game video</label>
-          <input ref={fileRef} type="file" accept="video/*" onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+          <input ref={fileRef} type="file" accept="video/*" onChange={(e) => onPickFile(e.target.files?.[0] ?? null)}
             className="block text-sm text-foreground" />
         </div>
+
+        {/* Court calibration — click the 4 corners for metric speed/distance */}
+        {frameUrl && (
+          <div>
+            <label className="block text-xs text-muted-foreground mb-1">
+              Court calibration <span className="text-muted-foreground">(optional — for real speed/distance)</span>
+            </label>
+            <p className="text-xs text-muted-foreground mb-2">
+              Click the 4 court corners in this order: <b>1</b> far-left, <b>2</b> far-right,
+              <b> 3</b> near-right, <b>4</b> near-left. {corners.length}/4 marked.
+              {corners.length > 0 && (
+                <button type="button" onClick={() => setCorners([])} className="text-red-500 hover:underline ml-2">reset</button>
+              )}
+            </p>
+            <div
+              className="relative inline-block cursor-crosshair rounded-lg overflow-hidden border border-border max-w-full"
+              onClick={(e) => {
+                if (corners.length >= 4) return
+                const rect = e.currentTarget.getBoundingClientRect()
+                setCorners((prev) => [...prev, { x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height }])
+              }}
+            >
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={frameUrl} alt="First frame" className="block max-w-full max-h-[360px]" />
+              <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
+                {corners.length >= 2 && (
+                  <polygon points={corners.map((c) => `${c.x * 100},${c.y * 100}`).join(' ')}
+                    fill="rgba(34,197,94,0.12)" stroke="#22c55e" strokeWidth="0.4" />
+                )}
+                {corners.map((c, i) => (
+                  <g key={i}>
+                    <circle cx={c.x * 100} cy={c.y * 100} r="1.1" fill="#22c55e" />
+                    <text x={c.x * 100 + 1.5} y={c.y * 100 - 1} fontSize="4" fontWeight="700" fill="#22c55e">{i + 1}</text>
+                  </g>
+                ))}
+              </svg>
+            </div>
+            {corners.length === 4 && (
+              <p className="text-xs text-green-500 mt-1">Calibrated — speed &amp; distance will be in meters.</p>
+            )}
+          </div>
+        )}
+
         <div className="flex flex-wrap gap-4">
           <div>
             <label className="block text-xs text-muted-foreground mb-1">Court</label>
